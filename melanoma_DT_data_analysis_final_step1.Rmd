@@ -1,0 +1,629 @@
+---
+title: "Melanoma single-cell DT data - Data preprocessing"
+author: "Yingxin Lin"
+date: "Created on 11 July 2022, last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    fig_height: 12
+    fig_width: 12
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+results_dir <- "/albona/nobackup2/yingxinl/melanoma_github/results/final"
+figures_dir <- "/albona/nobackup2/yingxinl/melanoma_github/figures/final"
+sourcedata_dir <- "/albona/nobackup2/yingxinl/melanoma_github/source_data/final"
+dir.create(results_dir, recursive = TRUE)
+dir.create(figures_dir, recursive = TRUE)
+dir.create(sourcedata_dir, recursive = TRUE)
+```
+
+
+
+# Package
+
+```{r}
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(ggpubr)
+library(moon) # Yingxin's personal package
+library(pheatmap)
+library(reshape2)
+library(gridExtra)
+library(RColorBrewer)
+library(UpSetR)
+library(scattermore)
+library(scater)
+library(scran)
+library(ggridges)
+library(rcartocolor)
+library(Rtsne)
+library(ggalluvial)
+library(ggrepel)
+library(BiocParallel)
+library(BiocSingular)
+library(BiocNeighbors)
+library(openxlsx)
+ggplot2::theme_set(theme_bw() + theme_yx() + 
+                     theme(axis.text.y = element_text(color = "black"),
+                           axis.text.x = element_text(color = "black"),
+                           axis.ticks.x = element_line(color = "black"),
+                           axis.ticks.y = element_line(color = "black")))
+```
+
+
+# Data
+
+```{r}
+sce_melanoma <- readRDS(file.path(sourcedata_dir, "sce_melanoma_raw.rds"))
+```
+
+
+
+# Quality control
+
+
+
+```{r}
+nUMI <- colSums(counts(sce_melanoma))
+summary(nUMI)
+
+nGene <- colSums(counts(sce_melanoma) != 0)
+summary(nGene)
+
+mt_genes <- grep("MT-", rowData(sce_melanoma)[, "Symbol"])
+MT_prop <- colSums(counts(sce_melanoma)[mt_genes, ])/nUMI
+
+sce_melanoma$nUMI <- nUMI
+sce_melanoma$nGene <- nGene
+sce_melanoma$MT_prop <- MT_prop
+```
+
+
+```{r}
+df_toPlot <- moon::makeMoonDF(sce_melanoma)
+```
+
+
+
+```{r}
+g1 <- ggplot(df_toPlot, aes(x = nUMI)) +
+  geom_histogram(bins = 50) +
+  scale_color_viridis_d() +
+  theme(aspect.ratio = 0.6) +
+  scale_x_log10() +
+  geom_vline(xintercept = 500, color = "red")+
+  geom_vline(xintercept = 80000, color = "red")
+
+
+g2 <- ggplot(df_toPlot, aes(x = nGene)) +
+  geom_histogram(bins = 50) +
+  scale_color_viridis_d() +
+  theme(aspect.ratio = 0.6) +
+  scale_x_log10() +
+  geom_vline(xintercept = 400, color = "red")
+
+
+g3 <- ggplot(df_toPlot, aes(x = MT_prop)) +
+  geom_histogram(bins = 50) +
+  scale_color_viridis_d() +
+  theme(aspect.ratio = 0.6) +
+  geom_vline(xintercept = 0.2, color = "red") +
+  xlab("MT%")
+ggarrange(g1, g2, g3, ncol = 1, nrow = 3, align = "hv")
+ggsave(file.path(figures_dir, "qc.pdf"), width = 6, height = 10)
+saveRDS(df_toPlot[, c("nUMI", "nGene", "MT_prop")], file = file.path(sourcedata_dir, "qc.rds"))
+```
+
+
+```{r}
+keep <- nUMI < 80000 & nUMI > 500 & nGene > 400 & MT_prop < 0.2
+table(keep)
+table(keep, sce_melanoma$Sample)
+```
+
+
+
+Keel cells with nUMI < 80000 & nUMI > 500 & nGene > 400 & MT_prop < 0.2
+
+
+```{r}
+sce_melanoma <- sce_melanoma[, keep]
+sce_melanoma <- sce_melanoma[rowSums(counts(sce_melanoma)) != 0, ]
+sce_melanoma
+sce_melanoma <- logNormCounts(sce_melanoma)
+```
+
+# Cell type classification 
+
+```{r}
+refine_prediction <- readRDS("results/scClassify_selfTraining_prediction.rds")
+refine_prediction <- refine_prediction[, 2]
+label_len <- unlist(lapply(strsplit(refine_prediction, "_"), length))
+refine_prediction[label_len > 1] <- "intermediate"
+sce_melanoma$scClassify_celltype <- refine_prediction
+celltype_color <- RColorBrewer::brewer.pal(12, "Paired")[c(1:10)]
+celltype_color <- c(celltype_color, "grey70")
+
+names(celltype_color) <- names(table(refine_prediction))
+celltype_color["intermediate"] <- "grey90"
+```
+
+
+```{r}
+df_toPlot <- moon::makeMoonDF(sce_melanoma)
+```
+
+
+
+```{r}
+sce_melanoma$Patient_publish <- paste("Patient", as.numeric(factor(sce_melanoma$Patient)), sep = "#")
+sce_melanoma$Sample_publish <- paste(sce_melanoma$Patient_publish,
+                                     sce_melanoma$Condition, sep = " ")
+
+
+meta_data_publish <- colData(sce_melanoma)[, c("Patient_publish",
+                                               "Sample_publish",
+                                               "Patient",
+                                               "Sample",
+                                               "Sample.type",
+                                               "Condition")]
+meta_data_publish <- unique(meta_data_publish)
+meta_data_publish <- data.frame(meta_data_publish)
+write.csv(meta_data_publish, file = "source_data/final/meta_remap_sample.csv")
+```
+
+
+# Exploratory data analysis
+
+
+```{r}
+rownames(sce_melanoma) <- rowData(sce_melanoma)$Symbol
+hvg_fit <- scran::modelGeneVar(sce_melanoma, block = sce_melanoma$Sample)
+hvg <- scran::getTopHVGs(hvg_fit, n = 2000)
+
+use_bpparam <- MulticoreParam(workers = 10)
+BiocParallel::bpprogressbar(use_bpparam) <- TRUE
+
+filter <- grepl("RPL|RPS|^MT-|ERCC|MTMR|MTND", rownames(sce_melanoma))
+gene_corMat <- qlcMatrix::cosSparse(t((logcounts(sce_melanoma)[filter, ])), 
+                                    t((logcounts(sce_melanoma)[!filter, ])))
+gene_corMat_max <- apply(gene_corMat, 2, max, na.rm = TRUE)
+exclude_genes <- c(rownames(sce_melanoma)[filter], 
+                   names(gene_corMat_max)[gene_corMat_max > 0.8])
+filter <- rownames(sce_melanoma) %in% exclude_genes
+
+hvg <- setdiff(hvg, exclude_genes)
+set.seed(2022)
+sce_melanoma <- runPCA(sce_melanoma, ncomponents = 20, subset_row = hvg, BPPARAM = use_bpparam, BSPARAM = RandomParam())
+set.seed(2022)
+sce_melanoma <- runUMAP(sce_melanoma, dimred = "PCA", min_dist = 0.3, verbose = TRUE)
+```
+
+
+## Cell type proportion
+
+```{r}
+df_toPlot <- moon::makeMoonDF(sce_melanoma)
+
+```
+
+```{r}
+ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = scClassify_celltype)) +
+  geom_scattermore() +
+  scale_color_manual(values = celltype_color) +
+  theme(aspect.ratio = 1) +
+  labs(color = "")
+ggsave(file.path(figures_dir, "umap_celltype.pdf"), width = 8, height = 6)
+saveRDS(df_toPlot[, c("UMAP1", "UMAP2", "scClassify_celltype")], 
+        file = file.path(sourcedata_dir, "umap_celltype.rds"))
+
+
+ggplot(df_toPlot[!df_toPlot$scClassify_celltype %in% c("intermediate", "unassigned"), ],
+       aes(x = factor(Sample, levels = rev(unique(df_toPlot$Sample2))), 
+           fill = scClassify_celltype)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = celltype_color) +
+  theme(aspect.ratio = 0.4) +
+  labs(fill = "") +
+  coord_flip() +
+  facet_grid(factor(Sample.type, levels = rev(names(table(df_toPlot$Sample.type))))~., scale = "free") +
+  xlab("") +
+  ylab("Cell type proportion")
+
+ggsave(file.path(figures_dir, "celltype_proportion.pdf"), width = 8, height = 4)
+saveRDS(df_toPlot[!df_toPlot$scClassify_celltype %in% c("intermediate", "unassigned"), 
+                  c("UMAP1", "UMAP2", "scClassify_celltype", "Sample", "Sample.type")], 
+        file = file.path(sourcedata_dir, "celltype_proportion.rds"))
+
+
+
+ggplot(df_toPlot[!df_toPlot$scClassify_celltype %in% c("intermediate", "unassigned"), ],
+       aes(x = factor(Sample_publish, levels = rev(sort(unique(df_toPlot$Sample_publish)))), 
+           fill = scClassify_celltype)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = celltype_color) +
+  theme(aspect.ratio = 0.4) +
+  labs(fill = "") +
+  coord_flip() +
+  facet_grid(factor(Sample.type, levels = rev(names(table(df_toPlot$Sample.type))))~., scale = "free") +
+  xlab("") +
+  ylab("Cell type proportion")
+
+ggsave(file.path(figures_dir, "celltype_proportion_publish.pdf"), width = 8, height = 4)
+saveRDS(df_toPlot[!df_toPlot$scClassify_celltype %in% c("intermediate", "unassigned"), 
+                  c("UMAP1", "UMAP2", "scClassify_celltype", "Sample_publish", "Sample.type")], 
+        file = file.path(sourcedata_dir, "celltype_proportion_publish.rds"))
+
+```
+
+
+```{r}
+celltype_prop <- table(df_toPlot[!df_toPlot$scClassify_celltype %in% c("intermediate", "unassigned"), ]$scClassify_celltype,
+                       df_toPlot[!df_toPlot$scClassify_celltype %in% c("intermediate", "unassigned"), ]$Sample)
+celltype_prop <- apply(celltype_prop, 2, function(x) x/sum(x))
+celltype_prop <- melt(celltype_prop)
+colnames(celltype_prop) <- c("Celltype", "Sample", "Prop")
+sample_meta <- unique(df_toPlot[, c("Sample", "Sample.type", "Condition", "Patient", 
+                                    "Sample_publish", "Patient_publish")])
+celltype_prop <- merge(celltype_prop, sample_meta, by = "Sample")
+ggplot(celltype_prop, aes(x = Condition, y = Prop * 100, color = Sample.type)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_wrap(~Celltype, nrow = 1, scale = "free") +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion") 
+ggsave(file.path(figures_dir, "celltype_proportion_dots.pdf"), width = 13, height = 4)
+saveRDS(celltype_prop, 
+        file = file.path(sourcedata_dir, "celltype_proportion_dots.rds"))
+
+
+ggplot(celltype_prop, aes(x = Condition, y = Prop * 100, color = Condition)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_grid(Celltype~Sample.type, scale = "free") +
+  scale_color_brewer(palette = "Set1") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion") 
+
+ggsave(file.path(figures_dir, "celltype_proportion_dots_v2.pdf"), width = 8, height = 13)
+```
+
+
+```{r}
+ggplot(celltype_prop, aes(x = Sample.type, y = Prop * 100, color = Condition)) +
+  geom_boxplot() +
+  facet_wrap(~Celltype, nrow = 1, scale = "free") +
+  scale_color_brewer(palette = "Set1") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion") 
+ggsave(file.path(figures_dir, "celltype_proportion_boxplot.pdf"), width = 13, height = 4)
+```
+
+
+
+
+```{r}
+lmer_res <- list()
+for (i in levels(celltype_prop$Celltype)) {
+  df_subset <- celltype_prop[celltype_prop$Celltype == i, ]
+  
+  lmer_res[[i]] <- lmerTest::lmer(Prop ~ Sample.type * Condition + (1|Patient), data = df_subset)
+}
+
+
+lapply(lmer_res, function(x) round(summary(x)$coefficients, 3))
+```
+
+
+
+```{r}
+g3 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = Sample_publish)) +
+  geom_scattermore() +
+  scale_color_tableau(palette = "Tableau 20") +
+  theme(aspect.ratio = 1) +
+  labs(color = "")
+
+
+g1 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = Patient_publish)) +
+  geom_scattermore() +
+  scale_color_tableau(palette = "Tableau 10") +
+  theme(aspect.ratio = 1) +
+  labs(color = "")
+
+
+
+g2 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = Condition)) +
+  geom_scattermore() +
+  scale_color_brewer(palette = "Set1") +
+  theme(aspect.ratio = 1) +
+  labs(color = "")
+
+
+
+
+g4 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = Sample.type)) +
+  geom_scattermore() +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1) +
+  labs(color = "")
+
+ggarrange(g3, g1, g2, g4, ncol = 2, nrow = 2, align = "hv")
+ggsave(file.path(figures_dir, "umap_supp.pdf"), width = 16, height = 12)
+saveRDS(df_toPlot[, c("UMAP1", "UMAP2", "Sample", "Patient", "Condition", "Sample.type")], 
+        file = file.path(sourcedata_dir, "umap_supp.rds"))
+```
+
+
+## Comparison of cell type proportion with the flow cyto
+
+```{r}
+flow_prop <- readxl::read_xls("data/Combined Flow  - Copy.xls")
+flow_prop <- flow_prop[-1, ]
+flow_prop <- data.frame(flow_prop)
+flow_prop <- flow_prop[-11, ]
+flow_prop$Sample <- flow_prop[, 1]
+flow_prop$Sample[flow_prop$Sample == "SCC16_0069 B23_02_16 M3_DMSO_009.fcs"] <- "SCC16_0069_B230216_DMSO"
+flow_prop$Sample[flow_prop$Sample == "SCC16_0069 B23_02_16 M3_DT_010.fcs"] <- "SCC16_0069_B230216_DT"
+
+flow_prop$Sample[flow_prop$Sample == "SCC20_0352 B29_10_20 Left Axillary_DMSO_005.fcs"] <- "SCC20_0352_B291020_DMSO"
+flow_prop$Sample[flow_prop$Sample == "SCC20_0352 B29_10_20 Left Axillary_DT_006.fcs"] <- "SCC20_0352_B291020_DT"
+
+flow_prop$Sample[flow_prop$Sample == "SMU09_0157 B11_04_2019 Chest wall_DMSO_023.fcs"] <- "SMU09_0157_B110419_DMSO"
+flow_prop$Sample[flow_prop$Sample == "SMU09_0157 B11_04_2019 Chest wall_DT_024.fcs"] <- "SMU09_0157_B110419_DT"
+
+
+flow_prop$Sample[flow_prop$Sample == "SMU17-0209 B13_06_2017 Small Bowel_DMSO_005.fcs"] <- "SMU17_0209_B130617_DMSO"
+flow_prop$Sample[flow_prop$Sample == "SMU17-0209 B13_06_2017 Small Bowel_DT_006.fcs"] <- "SMU17_0209_B130617_DT"
+
+flow_prop$Sample[flow_prop$Sample == "SMU18_0283 B09_01_2019 LI LN_Full DMSO_007.fcs"] <- "SMU18_0283_B090119_DMSO"
+flow_prop$Sample[flow_prop$Sample == "SMU18_0283 B09_01_2019 LI LN_Full DT_008.fcs"] <- "SMU18_0283_B090119_DT"
+
+flow_prop$Sample[flow_prop$Sample == "Treatment TD_0500 Control_016.fcs"] <- "SCC16_0500_B101017_DMSO"
+flow_prop$Sample[flow_prop$Sample == "Treatment TD_0500 DT_017.fcs"] <- "SCC16_0500_B101017_DT"
+
+
+flow_prop$Sample[flow_prop$Sample == "Treatment 0306_Full stain Control_016.fcs"] <- "SMU19_0306_B290620_DMSO"
+flow_prop$Sample[flow_prop$Sample == "Treatment 0306_Full stain DT_017.fcs"] <- "SMU19_0306_B290620_DT"
+
+
+flow_prop$Sample[flow_prop$Sample == "Treatment TD_0132 Control_014.fcs"] <- "SMU17_0132_B180418_DMSO"
+flow_prop$Sample[flow_prop$Sample == "Treatment TD_0132 DT_015.fcs"] <- "SMU17_0132_B180418_DT"
+
+
+
+flow_prop$Sample[flow_prop$Sample == "Treatment TD_0017 Control_016.fcs"] <- "SMU18_0017_B110518_DMSO"
+flow_prop$Sample[flow_prop$Sample == "Treatment TD_0017 DT_017.fcs"] <- "SMU18_0017_B110518_DT"
+
+
+flow_prop$Sample[flow_prop$Sample == "Treatment 0075_Distal Control_014.fcs"] <- "SMU17_0075_B070921_DMSO"
+flow_prop$Sample[flow_prop$Sample == "Treatment 0075_Distal DT_015.fcs"] <- "SMU17_0075_B070921_DT"
+
+rownames(flow_prop) <- flow_prop$Sample
+```
+
+
+```{r}
+t_flow <- flow_prop[, "Total.T.cells...Live.dead"]
+
+t_flow <- as.numeric(t_flow)
+names(t_flow) <- rownames(flow_prop)
+
+t_celltype_prop <- celltype_prop[celltype_prop$Celltype == "T cells", ]
+plot(t_celltype_prop$Prop, t_flow[as.character(t_celltype_prop$Sample)])
+df <- cbind(t_celltype_prop, flow = t_flow[as.character(t_celltype_prop$Sample)])
+g_T <- ggplot(df, aes(x = Prop * 100, y = flow)) +
+  geom_point(aes(color = Sample_publish), size = 3, alpha = 1) +
+  theme(aspect.ratio = 1) +
+  xlab("% of T cells in single-cell") +
+  ylab("% of T cells in flow cyto") +
+  scale_color_tableau(palette = "Tableau 20") +
+  geom_text(aes(x = 10, y = 30, label = paste("cor =", round(cor(df$Prop * 100, df$flow), 2)))) +
+  labs(color = "")
+g_T
+cor.test(df$Prop * 100, df$flow)
+ggsave(file.path(figures_dir, "T_cells_celltype_proportion_comparison.pdf"), width = 5, height = 4)
+saveRDS(df, 
+        file = file.path(sourcedata_dir, "T_cells_celltype_proportion.rds"))
+
+
+
+tumor_flow <- flow_prop[, "X..SOX10..MLM...Live.Dead"]
+tumor_flow <- gsub(" %", "", tumor_flow)
+tumor_flow <- as.numeric(tumor_flow)
+names(tumor_flow) <- rownames(flow_prop)
+
+tumor_celltype_prop <- celltype_prop[celltype_prop$Celltype == "Tumor cells", ]
+df <- cbind(tumor_celltype_prop, flow = tumor_flow[as.character(tumor_celltype_prop$Sample)])
+g_tumor <- ggplot(df, aes(x = Prop * 100, y = flow)) +
+  geom_point(aes(color = Sample_publish), size = 3, alpha = 1) +
+  theme(aspect.ratio = 1) +
+  xlab("% of Tumor cells in single-cell") +
+  ylab("% of Tumor cells in flow cyto") +
+  scale_color_tableau(palette = "Tableau 20") +
+  geom_text(aes(x = 50, y = 90, label = paste("cor =", round(cor(df$Prop * 100, df$flow), 2)))) +
+  labs(color = "")
+g_tumor
+cor.test(df$Prop * 100, df$flow)
+ggsave(file.path(figures_dir, "Tumor_cells_celltype_proportion_comparison.pdf"), width = 5, height = 4)
+saveRDS(df, 
+        file = file.path(sourcedata_dir, "Tumor_cells_celltype_proportion.rds"))
+
+legend <- get_legend(
+  # create some space to the left of the legend
+  g_T + theme(legend.position = "bottom", legend.box.margin = margin(0, 0, 0, 12))
+)
+library(cowplot)
+plot_grid(plot_grid(g_T + theme(legend.position = "none"), 
+                    g_tumor + theme(legend.position = "none"), 
+                    labels = c('A', 'B'), align = "hv"),
+          legend, ncol = 1, rel_heights = c(1, .1))
+ggsave(file.path(figures_dir, "celltype_proportion_comparison.pdf"), width = 8, height = 6)
+```
+
+
+
+## Marker epxression
+
+```{r}
+
+
+g <- lapply(c("CD3E", "MS4A1", "CD68", "CD14",
+              "FAP",
+              "SOX10", "AXL", "MITF", "NGFR"), 
+            function(x) {
+              # o <- order(logcounts(sce_melanoma)[x, ])
+              ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, 
+                                    color = logcounts(sce_melanoma)[x, ])) +
+                geom_scattermore() +
+                theme(aspect.ratio = 1) +
+                scale_color_gradientn(colors = colorRampPalette(c("grey90", brewer.pal(n = 7, name = "Reds")))(100)) +
+                labs(color = "", title = x) 
+              
+            })
+ggarrange(plotlist = g, ncol = 3, nrow = 3, align = "hv")
+ggsave(file.path(figures_dir, "celltype_marker_example.pdf"), width = 12, height = 10)
+```
+
+
+
+
+```{r}
+library(cellyx)
+subset_idx <- !sce_melanoma$scClassify_celltype %in% c("intermediate", "unassigned", "Tumor cells")
+limma_res <- doLimma(logcounts(sce_melanoma)[, subset_idx], sce_melanoma$scClassify_celltype[subset_idx])
+limma_res <- lapply(limma_res, function(x) x[order(x$logFC, decreasing = TRUE), ])
+wb <- createWorkbook()
+lapply(seq_along(limma_res), function(i){
+  addWorksheet(wb = wb, sheetName = names(limma_res)[i])
+  writeData(wb, sheet = names(limma_res)[i], 
+            data.frame(limma_res[[i]]))
+})
+saveWorkbook(wb, file.path(sourcedata_dir, paste0("immune_celltype_marker", ".xlsx")), overwrite = TRUE)
+
+markers <- lapply(limma_res, function(x) rownames(x)[1:10])
+
+aggExprs <- lapply(names(limma_res), function(x) {
+  idx <- sce_melanoma$scClassify_celltype %in% x
+  rowMeans(logcounts(sce_melanoma)[unlist(markers), idx])
+})
+aggExprs <- do.call(cbind, aggExprs)
+colnames(aggExprs) <- names(limma_res)
+rdbu <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+pheatmap(t(aggExprs), cluster_cols = FALSE, cluster_rows = FALSE, 
+         scale = "column", color = rdbu, 
+         border_color = NA,
+         file = file.path(figures_dir, "heatmap_immune_celltype_marker_aggExprs.pdf"),
+         height = 3, width = 10)
+saveRDS(aggExprs, file.path(sourcedata_dir, paste0("immune_celltype_marker_aggExprs", ".rds")))
+
+```
+
+
+
+
+
+
+# Numbat results
+
+
+
+
+```{r}
+numbat_classify <- readRDS("/albona/nobackup2/yingxinl/melanoma/results/numbat_tumour_classification.rds")
+table(numbat_classify, sce_melanoma$scClassify_celltype)
+
+agree_prop <- sum(numbat_classify == "tumor" & sce_melanoma$scClassify_celltype == "Tumor cells")/sum(sce_melanoma$scClassify_celltype == "Tumor cells")
+print(agree_prop)
+
+g1 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = scClassify_celltype %in% "Tumor cells")) +
+  geom_scattermore() +
+  scale_color_viridis_d() +
+  theme(aspect.ratio = 1) +
+  labs(color = "", title = "Tumor in scClassify")
+
+
+g2 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = numbat_classify %in% "tumor")) +
+  geom_scattermore() +
+  scale_color_viridis_d() +
+  theme(aspect.ratio = 1) +
+  labs(color = "", title = "Tumor in Numbat")
+
+
+g3 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, 
+                            color = numbat_classify %in% "tumor" & 
+                              scClassify_celltype %in% "Tumor cells")) +
+  geom_scattermore() +
+  scale_color_viridis_d() +
+  theme(aspect.ratio = 1) +
+  labs(color = "", title = "Tumor in both")
+
+
+
+ggarrange(g1, g2, g3, ncol = 3, nrow = 1, align = "hv")
+
+ggsave(file.path(figures_dir, "umap_numbat.pdf"), width = 15, height = 6)
+df_toPlot$numbat_classify <- numbat_classify
+saveRDS(df_toPlot[, c("UMAP1", "UMAP2", "numbat_classify", "scClassify_celltype")], 
+        file = file.path(sourcedata_dir, "umap_numbat.rds"))
+
+
+
+tab <- table(numbat_classify == "tumor", sce_melanoma$scClassify_celltype == "Tumor cells")
+print(tab)
+tab <- melt(tab)
+colnames(tab) <- c("Numbat", "scClassify", "Count")
+
+ggplot(tab, aes(x = Numbat, y = factor(scClassify, levels = c(TRUE, FALSE)), fill = Count)) +
+  geom_tile() +
+  geom_text(aes(label = Count)) +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  theme(aspect.ratio = 1) +
+  ylab("scClassify")
+
+ggsave(file.path(figures_dir, "confusion_numbat_scClassify.rds.pdf"), width = 4, height = 3)
+saveRDS(tab, 
+        file = file.path(sourcedata_dir, "confusion_numbat_scClassify.rds"))
+
+mclust::adjustedRandIndex(numbat_classify == "tumor", 
+                          sce_melanoma$scClassify_celltype == "Tumor cells")
+```
+
+
+
+
+# Save data
+
+
+
+```{r}
+
+saveRDS(sce_melanoma, file = file.path(sourcedata_dir, "sce_melanoma.rds"))
+```
+
+
+
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+

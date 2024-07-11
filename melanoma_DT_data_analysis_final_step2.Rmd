@@ -1,0 +1,985 @@
+---
+title: "Melanoma single-cell DT data - Melanoma cell states identification"
+author: "Yingxin Lin"
+date: "Created on 12 July 2023, last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    fig_height: 12
+    fig_width: 12
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+results_dir <- "results/final"
+figures_dir <- "figures/final"
+sourcedata_dir <- "source_data/final"
+dir.create(results_dir, recursive = TRUE)
+dir.create(figures_dir, recursive = TRUE)
+dir.create(sourcedata_dir, recursive = TRUE)
+```
+
+
+
+
+
+# Package
+
+
+
+
+```{r}
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(ggpubr)
+library(moon) # Yingxin's personal package
+library(pheatmap)
+library(reshape2)
+library(gridExtra)
+library(RColorBrewer)
+library(UpSetR)
+library(scattermore)
+library(scater)
+library(scran)
+library(ggridges)
+library(rcartocolor)
+library(Rtsne)
+library(ggalluvial)
+library(ggrepel)
+library(BiocParallel)
+library(BiocSingular)
+library(BiocNeighbors)
+library(openxlsx)
+library(SparseArray)
+ggplot2::theme_set(theme_bw() + theme_yx() + 
+                     theme(axis.text.y = element_text(color = "black"),
+                           axis.text.x = element_text(color = "black")) )
+rdbu <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+reds <- colorRampPalette(c("white", brewer.pal(n = 7, name = "Reds")))(100)
+```
+
+
+```{r}
+library(fgsea)
+runFGSEA <- function(stats, pathways, scoreType = "std") {
+  fgseaRes <- fgsea(pathways = pathways,
+                    stats    = sort(stats),
+                    minSize = 5,
+                    maxSize = 10000,
+                    nproc = 1,
+                    scoreType = scoreType)
+  fgseaRes[order(fgseaRes$ES, decreasing = TRUE),]
+}
+library(org.Hs.eg.db)
+library(clusterProfiler)
+runGO <- function(gene_set, background, maxGSSize = 500) {
+  eg <- bitr(gene_set,
+             fromType = "SYMBOL", 
+             toType = "ENTREZID", 
+             OrgDb = "org.Hs.eg.db")
+  
+  geneList <- bitr(background,
+                   fromType = "SYMBOL", 
+                   toType = "ENTREZID", 
+                   OrgDb = "org.Hs.eg.db")
+  
+  ego_res <- enrichGO(gene = eg$ENTREZID,
+                      universe = geneList$ENTREZID,
+                      OrgDb = org.Hs.eg.db,
+                      ont = "BP",
+                      pAdjustMethod = "BH",
+                      minGSSize = 10,
+                      maxGSSize = maxGSSize,
+                      pvalueCutoff = 1,
+                      qvalueCutoff = 1,
+                      readable = TRUE)
+  return(ego_res)
+}
+
+
+library(GO.db)
+library(biomaRt)
+library(org.Hs.eg.db)
+retrieved <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:0034976", columns="SYMBOL")
+#GO:0034976
+#response to endoplasmic reticulum stress
+#GO: 0140467
+retrieved <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:0140467", columns="SYMBOL")
+```
+
+
+```{r}
+sce_melanoma_all <- readRDS("source_data/final/sce_melanoma.rds")
+colnames(sce_melanoma_all) <- sce_melanoma_all$Barcode
+# sce_melanoma <- readRDS("data/sce_melanoma.rds")
+# colnames(sce_melanoma) <- sce_melanoma$Barcode
+
+patient_color <- tableau_color_pal()(10)
+names(patient_color) <- names(table(sce_melanoma_all$Patient_publish))
+
+sample_color <- tableau_color_pal("Tableau 20")(20)
+names(sample_color) <- names(table(sce_melanoma_all$Sample_publish))
+
+```
+
+
+```{r}
+numbat_classify <- readRDS("results/numbat_tumour_classification.rds")
+table(numbat_classify, sce_melanoma_all$scClassify_celltype)
+
+```
+
+
+```{r}
+df_toPlot <- moon::makeMoonDF(sce_melanoma_all)
+```
+
+
+
+```{r}
+g1 <- ggplot(df_toPlot,
+             aes(x = UMAP1, y = UMAP2, color = scClassify_celltype)) +
+  geom_scattermore(pointsize = 1) +
+  theme(aspect.ratio = 1)  +
+  scale_color_manual(values = RColorBrewer::brewer.pal(11, "Paired")) +
+  labs(color = "Cell types")
+
+g2 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = numbat_classify)) +
+  geom_scattermore(pointsize = 1) +
+  theme(aspect.ratio = 1)  +
+  scale_color_manual(values = RColorBrewer::brewer.pal(10, "Paired")[c(9, 10)]) +
+  labs(color = "Numbat classification")
+
+g3 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = paste(numbat_classify == "tumor", scClassify_celltype == "Tumor cells"))) +
+  geom_scattermore(pointsize = 1) +
+  theme(aspect.ratio = 1)  +
+  scale_color_manual(values = RColorBrewer::brewer.pal(10, "Paired")[c(1, 2, 9, 10)]) +
+  labs(color = "Numbat|scClassify")
+
+g4 <- ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = ifelse(numbat_classify == "tumor" & scClassify_celltype == "Tumor cells", 
+                                                                 "Tumor cells", "Others"))) +
+  geom_scattermore(pointsize = 1) +
+  theme(aspect.ratio = 1)  +
+  scale_color_manual(values = RColorBrewer::brewer.pal(10, "Paired")[c(9, 10)]) +
+  labs(color = "Final")
+ggarrange(g1, g2, g3, g4, ncol = 2, nrow = 2, align = "hv")
+```
+
+
+
+
+
+
+Subset the cells to melanoma cells based on both scClassify and numbat notation
+
+```{r}
+sce_melanoma <- sce_melanoma_all[, sce_melanoma_all$scClassify_celltype == "Tumor cells" & numbat_classify == "tumor"]
+sce_melanoma
+```
+
+
+
+
+
+```{r}
+sce_melanoma_patient <- sce_melanoma[, sce_melanoma$Condition == "DMSO"]
+```
+
+```{r}
+melanoma_markers <- readxl::read_xlsx("data/mmc4-2.xlsx", skip = 1)
+melanoma_markers <- split(melanoma_markers$Gene, melanoma_markers$Signature)
+
+mean_trim_low <- function(x, trim = 0) {
+  mean(x[x >= quantile(x, trim)])
+}
+
+gene_scores <- lapply(melanoma_markers, function(x) {
+  apply(assay(sce_melanoma_patient, "logcounts")[intersect(x, rownames(sce_melanoma_patient)), ], 2, 
+        mean_trim_low, trim = 0.1)
+})
+
+
+IFNg <- readxl::read_xlsx("data/Hallmark_IFNg.xlsx", skip = 1)
+IFNg <- unlist(c(IFNg[, 1]))
+IFNg <- intersect(IFNg, rownames(sce_melanoma_patient))
+IFNg_scores <- apply(logcounts(sce_melanoma_patient)[IFNg, ], 2, mean_trim_low, trim = 0.1)
+Nazarian_markers <- read.csv("data/Nazarian_mapk_signature.csv", header = FALSE)
+Nazarian_markers <- intersect(Nazarian_markers$V1, rownames(sce_melanoma_patient))
+Nazarian_scores <- apply(logcounts(sce_melanoma_patient)[Nazarian_markers, ], 2, mean_trim_low, trim = 0.1)
+cc_genes <- lapply(Seurat::cc.genes.updated.2019, function(x) intersect(x, rownames(sce_melanoma_patient)))
+cc_s_scores <- apply(logcounts(sce_melanoma_patient)[cc_genes$s.genes, ], 2, mean_trim_low, trim = 0.1)
+cc_g2m_scores <- apply(logcounts(sce_melanoma_patient)[cc_genes$g2m.genes, ], 2, mean_trim_low, trim = 0.1)
+```
+
+
+```{r}
+
+
+hallmarkList <- readRDS("data/hallmarkList.rds")
+hallmarkList <- lapply(hallmarkList, function(x) intersect(x, rownames(sce_melanoma_patient)))
+hallmark_scores <- lapply(hallmarkList, function(x) {
+  colMeans(logcounts(sce_melanoma_patient)[intersect(x, rownames(sce_melanoma_patient)), ])
+})
+
+```
+
+
+# QC on melanoma cells
+
+```{r}
+
+hvg_fit <- scran::modelGeneVar(sce_melanoma_patient, block = sce_melanoma_patient$Sample)
+hvg <- scran::getTopHVGs(hvg_fit, n = 500)
+
+
+set.seed(2022)
+sce_melanoma_patient <- runPCA(sce_melanoma_patient, ncomponents = 20, 
+                               subset_row = hvg, BPPARAM = SerialParam(), BSPARAM = RandomParam())
+set.seed(2022)
+sce_melanoma_patient <- runUMAP(sce_melanoma_patient, dimred = "PCA", min_dist = 0.3, verbose = TRUE)
+
+
+
+df_toPlot <- moon::makeMoonDF(sce_melanoma_patient)
+
+
+```
+
+
+
+```{r}
+nUMI <- colSums(counts(sce_melanoma_patient))
+
+nGene <- colSums(counts(sce_melanoma_patient) != 0)
+
+RPLprop <- colSums(counts(sce_melanoma_patient)[grep("RPL|RPS", rownames(sce_melanoma_patient)),])/colSums(counts(sce_melanoma_patient))
+
+```
+
+
+
+```{r}
+remove_nUMI <- nUMI < 7000 | nGene < 2000
+df_toPlot <- moon::makeMoonDF(sce_melanoma_patient)
+
+```
+
+
+
+
+
+```{r}
+table(cc_g2m_scores > 1)
+
+funMixModel <- function(x, mu1, mu2, sd1, sd2, rho1, rho2) {
+  
+  dnorm(x, mean = mu1, sd = sd1) * rho1 -
+    dnorm(x, mean = mu2, sd = sd2) * rho2
+  
+  
+}
+
+
+
+
+# Function to get the threshold for correlation based on mixture model
+
+getThreshold <- function(mixmdl, verbose = FALSE){
+  
+  # if (verbose) {
+  #   plot(mixmdl, which = 2)
+  # }
+  
+  membership <- apply(mixmdl$posterior, 1, which.max)
+  m_list <- sort(unique(membership))
+  
+  mu_list <- mixmdl$mu
+  names(mu_list) <- seq_len(length(mu_list))
+  mu_list <- mu_list[m_list]
+  
+  if (length(mu_list) > 1) {
+    idx1 <- as.numeric(names(mu_list)[order(mu_list)][1])
+    idx2 <- as.numeric(names(mu_list)[order(mu_list)][2])
+    
+    root <- try(uniroot(funMixModel, interval = c(mixmdl$mu[idx1] -
+                                                    mixmdl$sigma[idx1],
+                                                  mixmdl$mu[idx2] +
+                                                    mixmdl$sigma[idx2]),
+                        mu1 = mixmdl$mu[idx1], mu2 = mixmdl$mu[idx2],
+                        sd1 = mixmdl$sigma[idx1], sd2 = mixmdl$sigma[idx2],
+                        rho1 = mixmdl$lambda[idx1],
+                        rho2 = mixmdl$lambda[idx2]),
+                silent = TRUE)
+    
+    
+    if (!"try-error" %in%  is(root)) {
+      t <- root$root
+    }else{
+      t <- 0
+    }
+    
+  }else{
+    t <- 0
+  }
+  
+  return(t)
+}
+```
+
+
+```{r}
+set.seed(2022)
+mixmdl_g2m <- try(mixtools::normalmixEM(cc_g2m_scores,
+                                        fast = TRUE,
+                                        maxrestarts = 100,
+                                        k = 2,
+                                        maxit = 1000,
+                                        # mu = c(-0.5, rep(0.5, length_unique_y - 2),  1),
+                                        # lambda = c(1/2),
+                                        # sigma = rep(0.2, length_unique_y),
+                                        ECM = TRUE,
+                                        verb = TRUE),
+                  silent = TRUE)
+
+mixmdl_g2m_threshold <- getThreshold(mixmdl_g2m)
+
+```
+
+
+
+
+
+```{r}
+set.seed(2022)
+mixmdl_s <- try(mixtools::normalmixEM(cc_s_scores,
+                                      fast = TRUE,
+                                      maxrestarts = 100,
+                                      k = 2,
+                                      maxit = 1000,
+                                      # mu = c(-0.5, rep(0.5, length_unique_y - 2),  1),
+                                      # lambda = c(1/2),
+                                      # sigma = rep(0.2, length_unique_y),
+                                      ECM = TRUE,
+                                      verb = TRUE),
+                silent = TRUE)
+
+mixmdl_s_threshold <- getThreshold(mixmdl_s)
+
+
+```
+
+```{r}
+set.seed(2022)
+cc_scores <- cc_s_scores + cc_g2m_scores
+
+mixmdl_cc <- try(mixtools::normalmixEM(cc_scores,
+                                       fast = TRUE,
+                                       maxrestarts = 100,
+                                       k = 2,
+                                       maxit = 1000,
+                                       # mu = c(-0.5, rep(0.5, length_unique_y - 2),  1),
+                                       # lambda = c(1/2),
+                                       # sigma = rep(0.2, length_unique_y),
+                                       ECM = TRUE,
+                                       verb = TRUE),
+                 silent = TRUE)
+
+mixmdl_cc_threshold <- getThreshold(mixmdl_cc)
+
+```
+
+
+
+```{r}
+mixmdl_g2m_threshold
+mixmdl_s_threshold
+cell_cycle_cells <- cc_g2m_scores > mixmdl_g2m_threshold | cc_s_scores > mixmdl_s_threshold 
+
+table(cell_cycle_cells)
+
+```
+
+```{r}
+inflammatroy_cells <- hallmark_scores$HALLMARK_INFLAMMATORY_RESPONSE > 0.4
+```
+
+
+```{r}
+table(cell_cycle_cells)
+table(inflammatroy_cells)
+table(remove_nUMI)
+```
+
+
+
+Remove the cells that are in cell cycle, inflamatory and with low UMI
+
+```{r}
+pure_cells <- !cell_cycle_cells & !inflammatroy_cells & !remove_nUMI
+table(pure_cells)
+
+ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = pure_cells)) +
+  geom_scattermore(pointsize = 1) +
+  theme(aspect.ratio = 1) +
+  scale_color_viridis_d()
+```
+
+
+
+
+```{r}
+cc_prop <- table(cell_cycle_cells, sce_melanoma_patient$Sample)
+round(apply(cc_prop, 2, function(x) x/sum(x)), 2)
+```
+
+```{r}
+sce_melanoma_patient_pure <- sce_melanoma_patient[, pure_cells]
+sce_melanoma_patient_pure
+```
+
+
+
+# scMerge2 on DMSO tumour cells
+
+
+```{r}
+library(inline)
+openblas.set.num.threads <- cfunction( signature(ipt="integer"),
+                                       body = 'openblas_set_num_threads(*ipt);',
+                                       otherdefs = c ('extern void openblas_set_num_threads(int);'),
+                                       libargs = c ('/usr/lib/x86_64-linux-gnu/openblas-pthread/libblas.so.3'),
+                                       language = "C",
+                                       convention = ".C"
+)
+openblas.set.num.threads(1)
+
+library(HDF5Array)
+library(rhdf5)
+
+library(scMerge)
+
+data(segList)
+batch_label <- sce_melanoma_patient_pure$Patient
+ctl_genes <- intersect(rownames(sce_melanoma_patient_pure), segList$human$human_scSEG)
+ncores <- 10
+
+hvg <- intersect(unlist(melanoma_markers), rownames(sce_melanoma_patient_pure))
+hvg <- setdiff(hvg, c("GDF15", "LGALS3"))
+start <- Sys.time()
+scMerge_res <- scMerge2(exprsMat = logcounts(sce_melanoma_patient_pure),
+                        batch = batch_label,
+                        cellTypes = NULL,
+                        condition = NULL,
+                        use_bpparam = BiocParallel::MulticoreParam(workers = ncores),
+                        use_bsparam = BiocSingular::RandomParam(),
+                        use_bnparam = BiocNeighbors::AnnoyParam(),
+                        ruvK = 20,
+                        ctl = ctl_genes,
+                        exprsMat_counts = NULL,
+                        k_celltype = 10,
+                        chosen.hvg = hvg,
+                        cosineNorm = FALSE,
+                        return_subset = FALSE,
+                        seed = 1)
+
+end <- Sys.time()
+
+scMerge_res$newY[scMerge_res$newY < 0.001] <- 0
+#scMerge_res$newY <- as(scMerge_res$newY, "dgCMatrix")
+
+assay(sce_melanoma_patient_pure, "scMerge") <- scMerge_res$newY
+
+saveRDS(scMerge_res, file = file.path(sourcedata_dir, "scMerge_res_melanoma_tumor_pure.rds"))
+
+filter <- grepl("RPL|RPS|^MT-|ERCC|MTMR|MTND", rownames(sce_melanoma_patient_pure))
+gene_corMat <- qlcMatrix::cosSparse(t((logcounts(sce_melanoma_patient_pure)[filter, ])), 
+                                    t((logcounts(sce_melanoma_patient_pure)[!filter, ])))
+gene_corMat_max <- apply(gene_corMat, 2, max, na.rm = TRUE)
+exclude_genes <- c(rownames(sce_melanoma_patient_pure)[filter], 
+                   names(gene_corMat_max)[gene_corMat_max > 0.8])
+filter <- rownames(sce_melanoma_patient_pure) %in% exclude_genes
+
+feature_selection <- function(exprsMat, batch, top_n = 2000, BPPARAM = SerialParam()) {
+  combined.dec <- scran::modelGeneVar(exprsMat, block = batch, BPPARAM = BPPARAM)
+  chosen.hvgs <- scran::getTopHVGs(combined.dec, n = top_n)
+  return(chosen.hvgs)
+}
+
+
+
+chosen.hvg <- feature_selection(logcounts(sce_melanoma_patient_pure),
+                                sce_melanoma_patient_pure$Sample,
+                                top_n = 500)
+chosen.hvg <- setdiff(chosen.hvg, exclude_genes)
+length(chosen.hvg)
+set.seed(2022)
+sce_melanoma_patient_pure <- runPCA(sce_melanoma_patient_pure, 
+                                    ncomponents = 10, 
+                                    #subset_row = setdiff(chosen.hvg, exclude_genes), 
+                                    BPPARAM = SerialParam(), 
+                                    BSPARAM = RandomParam(),
+                                    exprs_values = "scMerge")
+
+set.seed(2022)
+sce_melanoma_patient_pure <- runUMAP(sce_melanoma_patient_pure, dimred = "PCA", min_dist = 0.3, verbose = TRUE)
+```
+
+
+```{r}
+df_toPlot <- moon::makeMoonDF(sce_melanoma_patient_pure)
+df_toPlot$Sample_publish <- factor(df_toPlot$Sample_publish, levels = unique(df_toPlot$Sample_publish))
+df_toPlot$Patient_publish <- factor(df_toPlot$Patient_publish, levels = unique(df_toPlot$Patient_publish))
+g1 <- ggplot(df_toPlot[sample(nrow(df_toPlot)),], aes(x = UMAP1, y = UMAP2, color = Patient_publish)) +
+  geom_scattermore(pointsize = 2) +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = patient_color)
+
+
+g1
+ggsave(file.path(figures_dir, "UMAP_melanoma_reference.pdf"), width = 6, height = 5)
+
+g1 + facet_wrap(~Patient_publish, ncol = 5)
+ggsave(file.path(figures_dir, "UMAP_melanoma_reference_bySample.pdf"), width = 14, height = 5)
+
+saveRDS(df_toPlot[, c("UMAP1", "UMAP2", "Patient_publish")], 
+        file = file.path(sourcedata_dir,
+                         "UMAP_melanoma_reference_bySample.rds"))
+```
+
+```{r}
+seurat_obj <- Seurat::CreateSeuratObject(counts = counts(sce_melanoma_patient_pure))
+seurat_obj@assays$RNA@data <- logcounts(sce_melanoma_patient_pure)
+for(i in names(melanoma_markers))  {
+  seurat_obj <- Seurat::AddModuleScore(seurat_obj, list(intersect(rownames(seurat_obj), 
+                                                                  melanoma_markers[[i]])),
+                                       name = i)
+}
+
+seurat_module_scores <- seurat_obj@meta.data[, -c(1:3)]
+colnames(seurat_module_scores) <- names(melanoma_markers)
+```
+
+
+
+```{r}
+
+
+g <- lapply(names(gene_scores)[c(1, 4, 2, 6)], function(x) {
+  #df_toPlot$scores <- gene_scores[[x]][colnames(sce_melanoma_patient_pure)]
+  df_toPlot$scores <- seurat_module_scores[colnames(sce_melanoma_patient_pure), x]
+  ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, 
+                        color = scale(scores))) +
+    geom_scattermore(pointsize = 2) +
+    theme(aspect.ratio = 1, legend.position = "bottom") +
+    scale_color_gradient2(  low = "#2166AC",
+                            mid = "white",
+                            high = "#B2182B") +
+    labs(color = x)
+})
+
+ggarrange(plotlist = g, ncol = 4, nrow = 1, align = "hv")
+ggsave(file.path(figures_dir, "UMAP_melanoma_reference_byScore.pdf"), width = 12, height = 5)
+
+saveRDS(cbind(df_toPlot[, c("UMAP1", "UMAP2")],
+              apply(seurat_module_scores, 2, scale)),
+        file = file.path(sourcedata_dir,
+                         "UMAP_melanoma_reference_byScore.rds"))
+```
+
+
+```{r}
+g <- lapply(names(hallmark_scores), function(x) {
+  df_toPlot$scores <- hallmark_scores[[x]][colnames(sce_melanoma_patient_pure)]
+  ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, 
+                        color = scores)) +
+    geom_scattermore(pointsize = 4) +
+    theme(aspect.ratio = 1, legend.position = "bottom") +
+    scale_color_viridis_c() +
+    labs(color = x)
+})
+
+ggarrange(plotlist = g, ncol = 3, nrow = 3, align = "hv")
+
+```
+
+
+
+# Clustering on DMSO cells (Coarse)
+
+```{r}
+
+set.seed(2022)
+sce_melanoma_patient_pure <- runPCA(sce_melanoma_patient_pure, ncomponents = 10,
+                                    subset_row = hvg,
+                                    BPPARAM = SerialParam(),
+                                    BSPARAM = RandomParam(),
+                                    exprs_values = "scMerge",
+                                    name = "PCA_scMerge")
+
+set.seed(2022)
+g <- scran::buildSNNGraph(sce_melanoma_patient_pure, k = 30, use.dimred = "PCA_scMerge")
+set.seed(2022)
+sample_cluster_coarse <- igraph::cluster_louvain(g)$membership
+sample_cluster_coarse <- factor(sample_cluster_coarse)
+sample_cluster_coarse[sample_cluster_coarse %in% c(6, 7)] <- 6
+sample_cluster_coarse[sample_cluster_coarse %in% c(1, 5, 4)] <- 1
+sce_melanoma_patient_pure$sample_cluster_coarse <- sample_cluster_coarse
+sce_melanoma_patient_pure$sample_cluster_coarse <- droplevels(sce_melanoma_patient_pure$sample_cluster_coarse)
+
+
+
+
+
+```
+
+
+
+```{r}
+sce_melanoma_patient_pure <- sce_melanoma_patient_pure[rowSums(counts(sce_melanoma_patient_pure)) != 0, ]
+marker_cluster <- cellyx::doLimma(logcounts(sce_melanoma_patient_pure), sce_melanoma_patient_pure$sample_cluster_coarse)
+marker_cluster <- lapply(marker_cluster, function(x) x[order(x$logFC, decreasing = TRUE), ])
+
+```
+
+
+
+
+```{r}
+gene_scores_mat <- do.call(cbind, lapply(gene_scores, function(x) x))
+gene_scores_mat_agg <- apply(gene_scores_mat[colnames(sce_melanoma_patient_pure), ], 2, function(x) aggregate(x, list(sce_melanoma_patient_pure$sample_cluster_coarse), mean)$x)
+rownames(gene_scores_mat_agg) <- levels(sce_melanoma_patient_pure$sample_cluster_coarse)
+
+
+
+pheatmap(scale(gene_scores_mat_agg[, names(gene_scores)[c(1, 5, 4, 3, 2, 7, 6)]]), 
+         cluster_cols = FALSE, 
+         cluster_rows = FALSE,
+         scale = "row", 
+         border_color = NA,
+         color = rdbu,
+         main = "Average expression of gene list (raw scores)")
+```
+
+
+```{r}
+cluster_order <- c(4, 2, 1, 3)
+pheatmap(gene_scores_mat_agg[cluster_order,
+                             names(gene_scores)[c(1, 5, 4, 3, 2, 7, 6)]],
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         # scale = "column",
+         border_color = NA,
+         color = reds,
+         main = "Average expression of gene list (raw scores)")
+
+
+
+pheatmap(scale(gene_scores_mat_agg[cluster_order,
+                                   names(gene_scores)[c(1, 5, 4, 3, 2, 7, 6)]]),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         scale = "row",
+         border_color = NA,
+         color = rdbu,
+         main = "Average expression of gene list (scaled scores)")
+
+```
+
+
+```{r}
+sample_cluster_factor <- factor(sce_melanoma_patient_pure$sample_cluster_coarse,
+                                levels = cluster_order)
+
+```
+
+
+```{r}
+sample_cluster_annotation <- plyr::mapvalues(sce_melanoma_patient_pure$sample_cluster_coarse,
+                                             from = rownames(gene_scores_mat_agg)[cluster_order],
+                                             to = c(names(gene_scores)[c(1, 4, 2, 6)]))
+sample_cluster_annotation <- factor(sample_cluster_annotation,
+                                    levels =  c(names(gene_scores)[c(1, 4, 2, 6)]))
+```
+
+
+
+```{r}
+
+melanoma_color_coarse <- RColorBrewer::brewer.pal(8, "Dark2")[c(4, 6, 5, 3, 8)]
+names(melanoma_color_coarse) <- c(names(gene_scores)[c(1, 4, 2, 6)], "unassigned")
+sce_melanoma_patient_pure$sample_cluster_annotation <- sample_cluster_annotation
+df_toPlot$sample_cluster_annotation <- sample_cluster_annotation
+
+
+ggplot(df_toPlot, aes(x = UMAP1, y = UMAP2, color = sample_cluster_annotation)) +
+  geom_scattermore(pointsize = 3) +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = melanoma_color_coarse) +
+  labs(color = " ")
+ggsave(file.path(figures_dir, "UMAP_reference_celltype_coarse_celltype_annotation.pdf"), width = 6, height = 5)
+saveRDS(df_toPlot[, c("UMAP1", "UMAP2", "sample_cluster_annotation")],
+        file = file.path(sourcedata_dir, "UMAP_reference_celltype_coarse_celltype_annotation.rds"))
+
+
+
+saveRDS(sample_cluster_annotation,
+        file.path(sourcedata_dir, "DMSO_pure_sample_cluster_annotation_coarse.rds"))
+```
+
+```{r}
+
+
+g <- lapply(c("SOX10", "AXL", "MITF", "NGFR"), 
+            function(x) {
+              o <- order(logcounts(sce_melanoma_patient_pure)[x, ], decreasing = FALSE)
+              ggplot(df_toPlot[o, ], aes(x = UMAP1, y = UMAP2, 
+                                         color = logcounts(sce_melanoma_patient_pure)[x, o])) +
+                geom_scattermore(pointsize = 5) +
+                theme(aspect.ratio = 1) +
+                scale_color_gradientn(colours = reds,
+                                      limits = c(0, 4)) +
+                labs(color = "", title = x) 
+              
+            })
+ggarrange(plotlist = g, ncol = 2, nrow = 2, align = "hv")
+ggsave(file.path(figures_dir, "tumor_reference_celltype_marker_example.pdf"), width = 12, height = 10)
+
+```
+
+
+```{r}
+
+
+gene_scores_mat_agg <- apply(seurat_module_scores[colnames(sce_melanoma_patient_pure), ], 2, function(x) aggregate(x, list(sce_melanoma_patient_pure$sample_cluster_annotation), mean)$x)
+rownames(gene_scores_mat_agg) <- levels(sce_melanoma_patient_pure$sample_cluster_annotation)
+
+
+
+pheatmap(scale(gene_scores_mat_agg[, names(gene_scores)[c(1, 5, 4, 3, 2, 7, 6)]]),
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         scale = "row",
+         border_color = NA,
+         color = rdbu,
+         main = "Average expression of gene list (scaled scores)",
+         file = file.path(figures_dir, "reference_celltype_coarse_celltype_gene_scores_heatmap.pdf"),
+         width = 5, height = 4)
+```
+
+
+
+```{r}
+
+saveRDS(sce_melanoma_patient_pure, file = file.path(sourcedata_dir, "sce_melanoma_pure.rds"))
+```
+
+
+
+```{r}
+scClassify_tumour_prediction <- readRDS("source_data/final/scClassify_tumour_prediction_coarse.rds")
+
+sce_melanoma$scClassify_tumour_prediction <- scClassify_tumour_prediction[, 3]
+sce_melanoma$scClassify_tumour_prediction[sce_melanoma$scClassify_tumour_prediction == "Neural crest-like_Undifferentiated"] <- "intermediate"
+df_toPlot <- moon::makeMoonDF(sce_melanoma)
+
+
+ggplot(df_toPlot[!df_toPlot$scClassify_tumour_prediction %in% c("intermediate", "unassigned"), ], 
+       aes(x = factor(Sample_publish, levels = rev(sort(unique(df_toPlot$Sample_publish)))),  
+           fill = factor(scClassify_tumour_prediction, levels = names(melanoma_color_coarse)))) +
+  geom_bar(position = "fill") +
+  theme(aspect.ratio = 0.4) +
+  scale_fill_manual(values = melanoma_color_coarse) +
+  coord_flip() +
+  facet_grid(factor(Sample.type, levels = rev(names(table(df_toPlot$Sample.type))))~., scale = "free") +
+  xlab("") +
+  labs(fill = "") +
+  ylab("Cell type proportion")
+ggsave(file.path(figures_dir, "melanoma_celltype_proportion_bar_fill_rename.pdf"), width = 8, height = 4)
+
+
+
+ggplot(df_toPlot[!df_toPlot$scClassify_tumour_prediction %in% c("intermediate", "unassigned"), ], 
+       aes(x = factor(Sample_publish, levels = rev(sort(unique(df_toPlot$Sample_publish)))),  
+           fill = factor(scClassify_tumour_prediction, levels = names(melanoma_color_coarse)))) +
+  geom_bar() +
+  theme(aspect.ratio = 0.4) +
+  scale_fill_manual(values = melanoma_color_coarse) +
+  coord_flip() +
+  facet_grid(factor(Sample.type, levels = rev(names(table(df_toPlot$Sample.type))))~., scale = "free") +
+  xlab("") +
+  labs(fill = "") +
+  ylab("Cell type proportion")
+ggsave(file.path(figures_dir, "melanoma_celltype_proportion_bar_nonfill_rename.pdf"), width = 8, height = 4)
+
+```
+
+
+
+```{r}
+celltype_prop <- table(df_toPlot[!df_toPlot$scClassify_tumour_prediction %in% c("intermediate", "unassigned"), ]$scClassify_tumour_prediction,
+                       df_toPlot[!df_toPlot$scClassify_tumour_prediction %in% c("intermediate", "unassigned"), ]$Sample)
+celltype_prop <- apply(celltype_prop, 2, function(x) x/sum(x))
+celltype_prop <- melt(celltype_prop)
+colnames(celltype_prop) <- c("Celltype", "Sample", "Prop")
+sample_meta <- unique(df_toPlot[, c("Sample", "Sample.type", "Condition", "Patient", 
+                                    "Sample_publish", "Patient_publish")])
+celltype_prop <- merge(celltype_prop, sample_meta, by = "Sample")
+ggplot(celltype_prop, aes(x = Condition, y = Prop * 100, color = Sample.type)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_wrap(~factor(Celltype, levels = names(melanoma_color_coarse)), nrow = 1, scale = "free") +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion") 
+ggsave(file.path(figures_dir, "tumor_celltype_proportion_dots.pdf"), width = 8, height = 3)
+saveRDS(celltype_prop, 
+        file = file.path(sourcedata_dir, "tumor_celltype_proportion_dots.rds"))
+```
+
+
+```{r}
+celltype_group <- df_toPlot[!df_toPlot$scClassify_tumour_prediction %in% c("intermediate", "unassigned"), ]$scClassify_tumour_prediction
+celltype_group <- ifelse(celltype_group %in% c("Melanocytic", "Transitory"),
+                         c("Melanocytic/Transitory"),
+                         c("Neural crest-like/Undifferentiated"))
+celltype_prop2 <- table(celltype_group,
+                        df_toPlot[!df_toPlot$scClassify_tumour_prediction %in% c("intermediate", "unassigned"), ]$Sample)
+celltype_prop2 <- apply(celltype_prop2, 2, function(x) x/sum(x))
+celltype_prop2 <- melt(celltype_prop2)
+colnames(celltype_prop2) <- c("Celltype", "Sample", "Prop")
+sample_meta <- unique(df_toPlot[, c("Sample", "Sample.type", "Condition", "Patient",
+                                    "Sample_publish", "Patient_publish")])
+celltype_prop2 <- merge(celltype_prop2, sample_meta, by = "Sample")
+ggplot(celltype_prop2, aes(x = Condition, y = Prop * 100, color = Sample.type)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_wrap(~Celltype, nrow = 1, scale = "free") +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion")
+# ggsave(file.path(figures_dir, "tumor_celltype_proportion_dots.pdf"), width = 13, height = 4)
+# saveRDS(celltype_prop,
+#         file = file.path(sourcedata_dir, "tumor_celltype_proportion_dots.rds"))
+ggplot(celltype_prop2, aes(x = Condition, y = Prop * 100, color = Sample.type)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_grid(Celltype~Sample.type, scale = "free") +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion")
+
+```
+
+
+
+
+
+
+```{r}
+lmer_res <- list()
+for (i in levels(celltype_prop$Celltype)) {
+  df_subset <- celltype_prop[celltype_prop$Celltype == i, ]
+  
+  lmer_res[[i]] <- lmerTest::lmer(Prop ~ Sample.type * Condition + (1|Patient), data = df_subset)
+}
+
+
+lapply(lmer_res, function(x) round(summary(x)$coefficients, 3))
+```
+
+
+
+```{r}
+lmer_res <- list()
+for (i in levels(celltype_prop$Celltype)) {
+  df_subset <- celltype_prop[celltype_prop$Celltype == i, ]
+  
+  lmer_res[[i]] <- lmerTest::lmer(Prop ~ Sample.type + Condition + (1|Patient), data = df_subset)
+}
+
+
+lapply(lmer_res, function(x) round(summary(x)$coefficients, 3))
+```
+
+
+
+
+
+
+# Nazarian scores before and after
+
+```{r}
+Nazarian_scores <- apply(logcounts(sce_melanoma)[Nazarian_markers, ], 2, mean_trim_low, trim = 0.1)
+
+df_agg_naz <- aggregate(Nazarian_scores[colnames(sce_melanoma)],
+                        list(df_toPlot$Sample_publish,
+                             df_toPlot$scClassify_tumour_prediction),
+                        mean)
+colnames(df_agg_naz) <- c("Sample_publish", "Celltype", "Nazarian_scores")
+
+
+meta_data_publish <- colData(sce_melanoma)[, c("Patient_publish",
+                                               "Sample_publish",
+                                               "Patient",
+                                               "Sample",
+                                               "Sample.type",
+                                               "Condition")]
+meta_data_publish <- unique(meta_data_publish)
+meta_data_publish <- data.frame(meta_data_publish)
+
+
+df_agg_naz <- merge(df_agg_naz, celltype_prop)
+
+ggplot(df_agg_naz[df_agg_naz$Celltype %in% setdiff(names(melanoma_color_coarse), "unassigned") & df_agg_naz$Prop > 0.01, ], 
+       aes(x = Condition, y = Nazarian_scores, color = Sample.type)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_wrap(~factor(Celltype, levels = names(melanoma_color_coarse)), nrow = 1, scale = "free") +
+  scale_color_brewer(palette = "Dark2") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion") 
+
+ggsave(file.path(figures_dir, "tumor_nazarian_scores_dots_bySampleType.pdf"), width = 8, height = 3)
+saveRDS(df_agg_naz, 
+        file = file.path(sourcedata_dir, "tumor_nazarian_scores_dots_bySampleType.rds"))
+
+ggplot(df_agg_naz[df_agg_naz$Celltype %in% setdiff(names(melanoma_color_coarse), "unassigned") & df_agg_naz$Prop > 0.01, ], 
+       aes(x = Condition, y = Nazarian_scores, color = Patient)) +
+  geom_line(aes(group = Patient), color = "black") +
+  geom_point() +
+  facet_wrap(~factor(Celltype, levels = names(melanoma_color_coarse)), nrow = 1, scale = "free") +
+  scale_color_tableau(palette = "Tableau 10") +
+  theme(aspect.ratio = 1, legend.position = "bottom") +
+  ylab("Cell type proportion") 
+
+ggsave(file.path(figures_dir, "tumor_nazarian_scores_dots_byPatient.pdf"), width = 8, height = 3)
+saveRDS(df_agg_naz, 
+        file = file.path(sourcedata_dir, "tumor_nazarian_scores_dots_bySampleType.rds"))
+```
+
+
+
+```{r}
+saveRDS(sce_melanoma, file = file.path(sourcedata_dir, "sce_melanoma_tumor.rds"))
+```
+
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+

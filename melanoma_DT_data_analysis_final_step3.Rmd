@@ -1,0 +1,260 @@
+---
+title: "Melanoma single-cell DT data - Melanoma cell states analysis"
+author: "Yingxin Lin"
+date: "Created on 11 July 2023, last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    fig_height: 12
+    fig_width: 12
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+results_dir <- "results/final"
+figures_dir <- "figures/final"
+sourcedata_dir <- "source_data/final"
+dir.create(results_dir, recursive = TRUE)
+dir.create(figures_dir, recursive = TRUE)
+dir.create(sourcedata_dir, recursive = TRUE)
+```
+
+
+
+
+
+# Package
+
+
+
+
+```{r}
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(ggpubr)
+library(moon) # Yingxin's personal package
+library(pheatmap)
+library(reshape2)
+library(gridExtra)
+library(RColorBrewer)
+library(UpSetR)
+library(scattermore)
+library(scater)
+library(scran)
+library(ggridges)
+library(rcartocolor)
+library(Rtsne)
+library(ggalluvial)
+library(ggrepel)
+library(BiocParallel)
+library(BiocSingular)
+library(BiocNeighbors)
+library(openxlsx)
+ggplot2::theme_set(theme_bw() + theme_yx() + 
+                     theme(axis.text.y = element_text(color = "black"),
+                           axis.text.x = element_text(color = "black")) )
+rdbu <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+reds <- colorRampPalette(c("white", brewer.pal(n = 7, name = "Reds")))(100)
+
+
+```
+
+
+```{r}
+sce_melanoma <- readRDS(file = file.path(sourcedata_dir, "sce_melanoma_tumor.rds"))
+```
+
+```{r}
+
+melanoma_color_coarse <- RColorBrewer::brewer.pal(8, "Dark2")[c(4, 6, 5, 3, 8)]
+names(melanoma_color_coarse) <- names(table(sce_melanoma$scClassify_tumour_prediction))[c(2, 4, 3, 6, 5)]
+```
+
+
+```{r}
+agg_melanoma <- scater::aggregateAcrossCells(sce_melanoma,
+                                             ids = colData(sce_melanoma)[,c("scClassify_tumour_prediction","Sample_publish")])
+saveRDS(agg_melanoma, file = file.path(sourcedata_dir, "sce_agg_melanoma_tumor.rds"))
+```
+
+```{r}
+agg_melanoma
+```
+
+```{r}
+Nazarian_markers <- read.csv("data/Nazarian_mapk_signature.csv", header = FALSE)
+Nazarian_markers <- intersect(Nazarian_markers$V1, rownames(sce_melanoma))
+```
+
+
+# DE analysis between two conditions
+
+
+## edgeR
+
+```{r}
+library(edgeR)
+edgeR_res <- list()
+for (i in names(melanoma_color_coarse)[c(1:4)]) {
+  print(i)
+  idx <- agg_melanoma$scClassify_tumour_prediction %in% i
+  
+  pb_dge <- DGEList(
+    counts = counts(agg_melanoma[, idx]),
+    samples = agg_melanoma$Sample[idx],
+    group = agg_melanoma$Condition[idx]
+  )
+  
+  pb_dge <- calcNormFactors(pb_dge)
+  
+  
+  pb_dge$samples$patient <- agg_melanoma$Patient[idx]
+  design <- model.matrix(~ group + patient, data = pb_dge$samples)
+  
+  pb_dge <- estimateDisp(pb_dge, design)
+  
+  pb_fit <- glmFit(pb_dge, design)
+  pb_lrt <- glmLRT(pb_fit, coef = 2)
+  edgeR_res[[i]] <- topTags(pb_lrt, n = Inf)
+  
+}
+
+
+g <- lapply(names(edgeR_res), function(x) {
+  volcanoData <- data.frame(edgeR_res[[x]]$table$logFC, -log10(edgeR_res[[x]]$table$FDR))
+  rownames(volcanoData) <- rownames(edgeR_res[[x]]$table)
+  
+  colnames(volcanoData) <- c("logFC", "negLogPval")
+  volcanoData$gene <-  rownames(volcanoData) 
+  ggplot(volcanoData, aes(x = logFC, y = negLogPval)) +
+    geom_point(color = "grey80") +
+    geom_point(data = volcanoData[Nazarian_markers, ], color = "red") +
+    geom_text_repel(data = volcanoData[abs(volcanoData$logFC) > 2 &
+                                         volcanoData$negLogPval > 15, ],
+                    aes(label = gene)) +
+    xlab("logFC") +
+    ylab("-log10(P.Adj)") +
+    labs(title = x) +
+    theme(aspect.ratio = 1)
+  
+})
+ggarrange(plotlist = g, ncol = 2, nrow = 2, align = "hv")
+ggsave(file.path(figures_dir, "vocanoplot_edgeR_melanoma_cell_states_between_condition.pdf"), width = 10, height = 8)
+saveRDS(edgeR_res, file.path(sourcedata_dir, "edgeR_melanoma_cell_states_between_condition.rds"))
+```
+
+## GSEA
+
+```{r}
+library(fgsea)
+runFGSEA <- function(stats, pathways, scoreType = "std") {
+  fgseaRes <- fgsea(pathways = pathways,
+                    stats    = sort(stats),
+                    minSize = 5,
+                    maxSize = 10000,
+                    nproc = 1,
+                    scoreType = scoreType)
+  fgseaRes[order(fgseaRes$ES, decreasing = TRUE),]
+}
+library(org.Hs.eg.db)
+library(clusterProfiler)
+runGO <- function(gene_set, background, maxGSSize = 500) {
+  eg <- bitr(gene_set,
+             fromType = "SYMBOL", 
+             toType = "ENTREZID", 
+             OrgDb = "org.Hs.eg.db")
+  
+  geneList <- bitr(background,
+                   fromType = "SYMBOL", 
+                   toType = "ENTREZID", 
+                   OrgDb = "org.Hs.eg.db")
+  
+  ego_res <- enrichGO(gene = eg$ENTREZID,
+                      universe = geneList$ENTREZID,
+                      OrgDb = org.Hs.eg.db,
+                      ont = "BP",
+                      pAdjustMethod = "BH",
+                      minGSSize = 10,
+                      maxGSSize = maxGSSize,
+                      pvalueCutoff = 1,
+                      qvalueCutoff = 1,
+                      readable = TRUE)
+  return(ego_res)
+}
+
+
+library(GO.db)
+library(biomaRt)
+library(org.Hs.eg.db)
+retrieved <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:0034976", columns="SYMBOL")
+#GO:0034976
+#response to endoplasmic reticulum stress
+#GO: 0140467
+retrieved <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:0140467", columns="SYMBOL")
+```
+
+
+```{r}
+selected_genes <- rownames(edgeR_res[[1]])[edgeR_res[[1]]$table$logFC < -2 & edgeR_res[[1]]$table$FDR < 0.05]
+res <- runGO(selected_genes, rownames(sce_melanoma), maxGSSize = 500)
+```
+
+
+```{r}
+hallmarkList <- readRDS("data/hallmarkList.rds")
+
+
+
+fgsea_res_list <- lapply(edgeR_res, function(x) {
+  
+  logfc <- x$table[, c("logFC")]
+  names(logfc) <- rownames(x$table)
+  fgsea_res <- runFGSEA(logfc, append(hallmarkList, list(Nazarian = Nazarian_markers)))
+  return(fgsea_res)
+})
+
+fgsea_res_list <- do.call(rbind, lapply(fgsea_res_list, data.frame))
+fgsea_res_list$cell_type <- unlist(lapply(strsplit(rownames(fgsea_res_list), "\\."), "[[", 1))
+```
+
+
+```{r}
+o <- fgsea_res_list %>% dplyr::select(NES, pathway) %>%
+  dplyr::group_by(pathway) %>%
+  dplyr::summarise(mean = mean(NES)) %>%
+  arrange(mean) %>% dplyr::select(pathway) %>% unlist()
+```
+
+
+```{r}
+ggplot(fgsea_res_list, aes(x = factor(cell_type, levels = names(edgeR_res)), 
+                           y = factor(pathway, levels = rev(o)), 
+                           size = -log10(padj), color = NES)) +
+  geom_point() +
+  geom_point(data = fgsea_res_list[fgsea_res_list$padj < 0.05, ], 
+             color = "red", shape = 1) +
+  scale_color_gradientn(colors = rdbu) +
+  theme(aspect.ratio = 5, 
+        axis.text.x = element_text(angle = 90, hjust = 1),
+        panel.border = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.ticks.y = element_blank()) +
+  xlab("") +
+  ylab("")
+ggsave(file.path(figures_dir, "fgsea_melanoma_cell_states_between_condition.pdf"), width = 8, height = 10)
+saveRDS(fgsea_res_list, file.path(sourcedata_dir, "fgsea_melanoma_cell_states_between_condition.rds"))
+```
+
+
+
