@@ -20,9 +20,9 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 
 ```{r}
-results_dir <- "/albona/nobackup2/yingxinl/melanoma_github/results/final"
-figures_dir <- "/albona/nobackup2/yingxinl/melanoma_github/figures/final"
-sourcedata_dir <- "/albona/nobackup2/yingxinl/melanoma_github/source_data/final"
+results_dir <- "results/final"
+figures_dir <- "figures/final"
+sourcedata_dir <- "source_data/final"
 dir.create(results_dir, recursive = TRUE)
 dir.create(figures_dir, recursive = TRUE)
 dir.create(sourcedata_dir, recursive = TRUE)
@@ -543,7 +543,7 @@ saveRDS(aggExprs, file.path(sourcedata_dir, paste0("immune_celltype_marker_aggEx
 
 
 ```{r}
-numbat_classify <- readRDS("/albona/nobackup2/yingxinl/melanoma/results/numbat_tumour_classification.rds")
+numbat_classify <- readRDS("results/numbat_tumour_classification.rds")
 table(numbat_classify, sce_melanoma$scClassify_celltype)
 
 agree_prop <- sum(numbat_classify == "tumor" & sce_melanoma$scClassify_celltype == "Tumor cells")/sum(sce_melanoma$scClassify_celltype == "Tumor cells")
