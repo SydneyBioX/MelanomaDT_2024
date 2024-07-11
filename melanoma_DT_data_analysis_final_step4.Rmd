@@ -1,0 +1,773 @@
+---
+title: "Melanoma single-cell DT data - Responder cell classification"
+author: "Yingxin Lin"
+date: "Created on 19 Dec 2022, last compiled on `r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: yes
+    toc: yes
+    fig_height: 12
+    fig_width: 12
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+results_dir <- "results/final"
+figures_dir <- "figures/final"
+sourcedata_dir <- "source_data/final"
+dir.create(results_dir, recursive = TRUE)
+dir.create(figures_dir, recursive = TRUE)
+dir.create(sourcedata_dir, recursive = TRUE)
+```
+
+
+
+
+
+# Package
+
+```{r}
+library(SingleCellExperiment)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(ggpubr)
+library(moon) # Yingxin's personal package
+library(pheatmap)
+library(reshape2)
+library(gridExtra)
+library(RColorBrewer)
+library(UpSetR)
+library(scattermore)
+library(scater)
+library(scran)
+library(ggridges)
+library(rcartocolor)
+library(Rtsne)
+library(ggalluvial)
+library(ggrepel)
+library(BiocParallel)
+library(BiocSingular)
+library(BiocNeighbors)
+library(openxlsx)
+library(org.Hs.eg.db)
+ggplot2::theme_set(theme_bw() + theme_yx() + 
+                     theme(axis.text.y = element_text(color = "black"),
+                           axis.text.x = element_text(color = "black")) )
+rdbu <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(100)
+reds <- colorRampPalette(c("white", brewer.pal(n = 7, name = "Reds")))(100)
+blues <- colorRampPalette(c("white", brewer.pal(n = 7, name = "Blues")))(100)
+```
+
+
+```{r}
+mean_trim_low <- function(x, trim = 0) {
+  mean(x[x >= quantile(x, trim)])
+}
+minMax <- function(x) {
+  (x - min(x))/(max(x) - min(x))
+}
+
+library(fgsea)
+runFGSEA <- function(stats, pathways, scoreType = "std") {
+  fgseaRes <- fgsea(pathways = pathways,
+                    stats    = sort(stats),
+                    minSize = 5,
+                    maxSize = 10000,
+                    nproc = 1,
+                    scoreType = scoreType)
+  fgseaRes[order(fgseaRes$ES, decreasing = TRUE),]
+}
+library(org.Hs.eg.db)
+library(clusterProfiler)
+runGO <- function(gene_set, background, maxGSSize = 500) {
+  eg <- bitr(gene_set,
+             fromType = "SYMBOL", 
+             toType = "ENTREZID", 
+             OrgDb = "org.Hs.eg.db")
+  
+  geneList <- bitr(background,
+                   fromType = "SYMBOL", 
+                   toType = "ENTREZID", 
+                   OrgDb = "org.Hs.eg.db")
+  
+  ego_res <- enrichGO(gene = eg$ENTREZID,
+                      universe = geneList$ENTREZID,
+                      OrgDb = org.Hs.eg.db,
+                      ont = "BP",
+                      pAdjustMethod = "BH",
+                      minGSSize = 10,
+                      maxGSSize = maxGSSize,
+                      pvalueCutoff = 1,
+                      qvalueCutoff = 1,
+                      readable = TRUE)
+  return(ego_res)
+}
+
+
+```
+
+
+```{r}
+sce <- readRDS("source_data/final/sce_melanoma.rds")
+colnames(sce) <- sce$Barcode
+numbat_classify <- readRDS("results/numbat_tumour_classification.rds")
+sce_melanoma <- readRDS("source_data/final//sce_melanoma_tumor.rds")
+
+
+melanoma_markers <- readxl::read_xlsx("data/mmc4-2.xlsx", skip = 1)
+melanoma_markers <- split(melanoma_markers$Gene, melanoma_markers$Signature)
+Nazarian_markers <- read.csv("data/Nazarian_mapk_signature.csv", header = FALSE)
+Nazarian_markers <- intersect(Nazarian_markers$V1, rownames(sce_melanoma))
+
+Pratilas_markers <- c("ARID5A", "B4GALT6", "BRIX1",	"BYSL", "CCND1", "CD3EAP",
+                      "CHSY1",	"DDX21",	"DUSP4",	"DUSP6",	"EGR1",	"ELOVL6",
+                      "ETV1",	"ETV4",	"ETV5",	"FLJ10534",	"FOS",	"FOSL1",
+                      "GEMIN4",	"GNL3",	"GPR3",	"GTPBP4",	"HMGA2",	"NOP16",
+                      "IER3",	"CXCL8",	"LIF",	"SH2B3",	"MAFF",	"MAP2K3",	"MYC",
+                      "PHLDA2",	"PLK3",	"POLR1C",	"POLR3G",	"PPAN",	"PPAT",
+                      "PYCRL",	"RRS1",	"SLC1A5",	"SLC4A7",	"SPRED2",	"SPRY2",
+                      "SPRY4",	"TNC",	"TNFRSF12A",	"WDR3",	"YRDC")
+Pratilas_markers <- intersect(Pratilas_markers, rownames(sce_melanoma))
+
+Nazarian_scores <- apply(logcounts(sce_melanoma)[Nazarian_markers, ], 2, mean_trim_low, trim = 0.1)
+cc_genes <- lapply(Seurat::cc.genes.updated.2019, function(x) intersect(x, rownames(sce_melanoma)))
+cc_s_scores <- apply(logcounts(sce_melanoma)[cc_genes$s.genes, ], 2, mean_trim_low, trim = 0.1)
+cc_g2m_scores <- apply(logcounts(sce_melanoma)[cc_genes$g2m.genes, ], 2, mean_trim_low, trim = 0.1)
+cc_scores <- cc_s_scores + cc_g2m_scores
+
+gene_scores <- lapply(melanoma_markers, function(x) {
+  apply(assay(sce_melanoma, "logcounts")[intersect(x, rownames(sce_melanoma)), ], 2,
+        mean_trim_low, trim = 0.1)
+})
+
+
+
+melanoma_color_coarse <- RColorBrewer::brewer.pal(8, "Dark2")[c(4, 6, 5, 3, 8)]
+names(melanoma_color_coarse) <- c(names(gene_scores)[c(1, 4, 2, 6)], "unassigned")
+
+hallmarkList <- readRDS("data/hallmarkList.rds")
+hallmarkList <- lapply(hallmarkList, function(x) intersect(x, rownames(sce_melanoma)))
+hallmark_scores <- lapply(hallmarkList[c("HALLMARK_INFLAMMATORY_RESPONSE", "HALLMARK_APOPTOSIS")], function(x) {
+  apply(logcounts(sce_melanoma)[intersect(x, rownames(sce_melanoma)), ], 2, mean_trim_low, trim = 0.1)
+})
+
+
+
+# GO:0097527 necroptotic
+retrieved_0097527 <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:0097527", columns="SYMBOL")
+markers_necroptotic <- unique(retrieved_0097527$SYMBOL)
+necroptotic_scores <- apply(logcounts(sce_melanoma)[markers_necroptotic, ], 2, mean_trim_low, trim = 0.1)
+hist(necroptotic_scores)
+
+#GO: 2001238 extrinsic apoptotic
+
+retrieved_2001238 <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:2001238", columns="SYMBOL")
+markers_extrinsic_apoptotic <- intersect(rownames(sce_melanoma), unique(retrieved_2001238$SYMBOL))
+extrinsic_apoptotic_scores <- apply(logcounts(sce_melanoma)[markers_extrinsic_apoptotic, ], 2, mean_trim_low, trim = 0.1)
+hist(extrinsic_apoptotic_scores, breaks = 100)
+cor(extrinsic_apoptotic_scores, cc_scores)
+cor(extrinsic_apoptotic_scores, hallmark_scores$HALLMARK_APOPTOSIS)
+plot(extrinsic_apoptotic_scores, cc_scores)
+
+#GO: 2001238 intrinsic 2001244
+
+retrieved_2001244 <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:2001244", columns="SYMBOL")
+markers_intrinsic_apoptotic <- intersect(rownames(sce_melanoma), unique(retrieved_2001244$SYMBOL))
+intrinsic_apoptotic_scores <- apply(logcounts(sce_melanoma)[markers_intrinsic_apoptotic, ], 2, mean_trim_low, trim = 0.1)
+hist(intrinsic_apoptotic_scores, breaks = 100)
+cor(intrinsic_apoptotic_scores, cc_scores)
+cor(intrinsic_apoptotic_scores, hallmark_scores$HALLMARK_APOPTOSIS)
+plot(intrinsic_apoptotic_scores, cc_scores)
+plot(intrinsic_apoptotic_scores + extrinsic_apoptotic_scores, cc_scores)
+
+#GO: 0010508
+
+retrieved_0010508 <- AnnotationDbi::select(org.Hs.eg.db, keytype="GOALL", keys="GO:0010508", columns="SYMBOL")
+markers_autophagy <- intersect(rownames(sce_melanoma), unique(retrieved_0010508$SYMBOL))
+autophagy_scores <- apply(logcounts(sce_melanoma)[markers_autophagy, ], 2, mean_trim_low, trim = 0.1)
+hist(autophagy_scores, breaks = 100)
+cor(autophagy_scores, cc_scores)
+cor(autophagy_scores, hallmark_scores$HALLMARK_APOPTOSIS)
+plot(autophagy_scores, cc_scores)
+
+celldeath_scores <- cbind(autophagy_scores, intrinsic_apoptotic_scores, extrinsic_apoptotic_scores, necroptotic_scores)
+celldeath_scores <- rowMeans(apply(celldeath_scores, 2, function(x) (x - min(x))/(max(x) - min(x))))
+cor(celldeath_scores, cc_scores)
+
+
+apoptosis <- celldeath_scores
+proliferation <- cc_s_scores + cc_g2m_scores
+proliferation <- minMax(proliferation)
+
+
+axl_program <- readxl::read_xlsx("data/aad0501_table_s8.xlsx")
+axl_program <- unlist(axl_program$`Tables S8. Genes in the AXL program from single cell analysis.`)[-c(1:3)]
+mitf_program <- readxl::read_xlsx("data/aad0501_table_s7.xlsx")
+mitf_program <- unlist(mitf_program$`Tables S7. Genes in the MITF program from single cell analysis.`)[-c(1:3)]
+axl_program <- intersect(axl_program, rownames(sce_melanoma))
+mitf_program <- intersect(mitf_program, rownames(sce_melanoma))
+axl_scores <- apply(logcounts(sce_melanoma)[axl_program, ], 2, mean_trim_low, trim = 0.1)
+mitf_scores <- apply(logcounts(sce_melanoma)[mitf_program, ], 2, mean_trim_low, trim = 0.1)
+```
+
+
+
+```{r}
+
+sce_melanoma_DMSO <- sce_melanoma[, sce_melanoma$Condition == "DMSO"]
+sce_melanoma_DMSO <- sce_melanoma_DMSO[, !sce_melanoma_DMSO$scClassify_tumour_prediction %in% c("unassigned", "intermediate")]
+sce_melanoma_DMSO
+
+
+sce_melanoma_DT <- sce_melanoma[, sce_melanoma$Condition == "DT"]
+sce_melanoma_DT <- sce_melanoma_DT[, !sce_melanoma_DT$scClassify_tumour_prediction %in% c("unassigned", "intermediate")]
+sce_melanoma_DT
+```
+
+
+# Signature exploration
+
+```{r}
+all_marker <- append(melanoma_markers, list(AXL = axl_program, MITF = mitf_program))
+library(Seurat)
+seu_obj <- CreateSeuratObject(counts = counts(sce_melanoma))
+seu_obj <- Seurat::AddModuleScore(seu_obj, features = all_marker)
+seu_scores <- seu_obj@meta.data[, grep("Cluster", colnames(seu_obj@meta.data))]
+colnames(seu_scores) <- names(all_marker)
+pheatmap(cor(seu_scores))
+```
+
+
+
+```{r}
+pheatmap(cor(do.call(cbind, gene_scores)))
+df_toPlot_melanoma <- moon::makeMoonDF(sce_melanoma)
+
+ggplot(df_toPlot_melanoma, aes(x = gene_scores$`Undifferentiated-Neural crest-like`,
+                               y = gene_scores$Melanocytic,
+                               color = Condition)) +
+  geom_scattermore(pointsize = 1) +
+  facet_wrap(~Patient, scale = "free", nrow = 1) +
+  scale_color_tableau() +
+  theme(aspect.ratio = 1)
+```
+
+
+
+
+```{r results = "hide", message=FALSE}
+library(fgsea)
+runFGSEA <- function(stats, pathways, scoreType = "std") {
+  fgseaRes <- fgsea(pathways = pathways,
+                    stats    = sort(stats),
+                    minSize = 5,
+                    maxSize = 10000,
+                    nproc = 1,
+                    scoreType = scoreType,
+                    nperm = 100000)
+  fgseaRes[order(fgseaRes$ES, decreasing = TRUE),]
+}
+```
+
+
+
+
+
+```{r}
+
+.n_cells <- function(x) {
+  y <- int_colData(x)$n_cells
+  if (is.null(y)) return(NULL)
+  if (length(metadata(x)$agg_pars$by) == 2)
+    y <- as.matrix(data.frame(y, check.names = FALSE))
+  return(as.table(y))
+}
+
+# limma trend
+library(limma)
+limma_trend <- function(exprsMat, group_id, coldata, coef = 2, covariate = NULL,  weights = NULL) {
+  keep <- rowMeans(exprsMat != 0) > 0.2
+  keep_sample <- colSums(exprsMat) != 0
+  
+  group_id <- group_id[keep_sample]
+  coldata <- coldata[keep_sample, ]
+  
+  
+  y <- methods::new("EList")
+  y$E <- scater::normalizeCounts(exprsMat[keep, keep_sample])
+  #y$E <- (exprsMat[keep, keep_sample])
+  if (!is.null(covariate)) {
+    fm1 <- as.formula(paste("~ group_id +", paste(covariate, collapse=" + ")))
+    design <- stats::model.matrix(fm1, data = coldata)
+  } else {
+    design <- stats::model.matrix(~group_id)
+  }
+  
+  
+  if (!is.null(weights)) {
+    weights <- weights[keep_sample]
+    fit <- limma::lmFit(y, design = design, weights = weights)
+  } else {
+    fit <- limma::lmFit(y, design = design)
+  }
+  
+  fit <- limma::eBayes(fit, trend = TRUE, robust = TRUE)
+  
+  
+  tt <- lapply(coef, function(x) {
+    res <- limma::topTable(fit, n = Inf, 
+                           adjust.method = "BH", 
+                           coef = x)
+    res$Group <- gsub("group_id", "",  colnames(design)[x])
+    res
+  })
+  names(tt) <-  gsub("group_id", "",  colnames(design)[coef])
+  
+  # tt_group2 <- limma::topTable(fit, n = Inf, adjust.method = "BH", 
+  #                              coef = 3)
+  # 
+  return(tt)
+}
+
+library(edgeR)
+
+# edgeR
+edgeR <- function(exprsMat, group_id, coldata, covariate = NULL, coef = 2) {
+  keep <- rowMeans(exprsMat != 0) > 0.2
+  keep_sample <- colSums(exprsMat) != 0
+  
+  y <- exprsMat[keep, keep_sample]
+  group_id <- group_id[keep_sample]
+  coldata <- coldata[keep_sample, ]
+  y <- suppressMessages(DGEList(y, 
+                                group = group_id, 
+                                remove.zeros = TRUE))
+  
+  
+  if (!is.null(covariate)) {
+    fm1 <- as.formula(paste("~ group_id +", paste(covariate, collapse=" + ")))
+    design <- stats::model.matrix(fm1, data = coldata)
+  } else {
+    design <- stats::model.matrix(~group_id)
+  }
+  
+  y <- estimateDisp(y, design = design)
+  fit <- glmQLFit(y, design = design)
+  qlf <- glmQLFTest(fit, coef = coef)
+  
+  
+  tt <- lapply(coef, function(x) {
+    qlf <- glmQLFTest(fit, coef = x)
+    tt <- topTags(qlf, n = Inf)[[1]]
+    tt$Group <- gsub("group_id", "",  colnames(design)[x])
+    tt
+  })
+  names(tt) <-  gsub("group_id", "",  colnames(design)[coef])
+  
+  
+  return(tt)
+}
+
+
+library(MAST)
+library(lme4)
+library(doParallel)
+MAST_ind <- function(sce, covariate, ncores = 10, exprs_prop = 0.05) {
+  
+  library(RhpcBLASctl)
+  blas_set_num_threads(1)
+  
+  options(mc.cores = ncores)
+  keep <- rowMeans(counts(sce) != 0) > exprs_prop
+  sce <- sce[keep, ]
+  sca <- FromMatrix(as.matrix(logcounts(sce)),
+                    colData(sce),
+                    rowData(sce))
+  fm1 <- as.formula(paste("~ group_id +  (1 | sample_id) +", paste(covariate, collapse=" + ")))
+  # 
+  # lmres <- pbmclapply(1:nrow(exprs_mat), function(x) {
+  #   x <- exprs_mat[x, ]
+  #   lmfit <- lmerTest::lmer(fm1)
+  # }, mc.cores = 10)
+  # 
+  mod <- zlm(formula = fm1, sca = sca, 
+             method = 'glmer', 
+             ebayes = FALSE, 
+             parallel = TRUE)
+  #lrt_res <- lrTest(mod, "diagnosis")
+  #stopCluster(cl)
+  return(mod)
+}
+
+```
+
+
+
+# Using Pratilas + Nazarian scores to define responder vs non-responder
+
+```{r}
+df_toPlot_melanoma$scClassify_tumour_prediction2 <- df_toPlot_melanoma$scClassify_tumour_prediction
+df_toPlot_melanoma$scClassify_tumour_prediction2[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% c("Melanocytic", "Transitory")] <- "Melanocytic/Transitory"
+df_toPlot_melanoma$celltype_patient2 <- paste(df_toPlot_melanoma$scClassify_tumour_prediction2, df_toPlot_melanoma$Sample, sep = "|")
+
+```
+
+
+```{r}
+combine_scores <- apply(logcounts(sce_melanoma)[intersect(Pratilas_markers, Nazarian_markers), ], 2, mean_trim_low, trim = 0.1)
+df_toPlot_melanoma$combine_scores <- combine_scores
+ggplot(df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate"), ], 
+       aes(x = scClassify_tumour_prediction, 
+           y = combine_scores, fill = Condition)) +
+  geom_boxplot() +
+  scale_fill_tableau()
+```
+
+
+
+```{r}
+
+wilcox.test(df_toPlot_melanoma$combine_scores[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Melanocytic/Transitory"] ~ df_toPlot_melanoma$Condition[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Melanocytic/Transitory"])
+wilcox.test(df_toPlot_melanoma$combine_scores[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Neural crest-like"] ~ df_toPlot_melanoma$Condition[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Neural crest-like"])
+wilcox.test(df_toPlot_melanoma$combine_scores[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Undifferentiated"] ~ df_toPlot_melanoma$Condition[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Undifferentiated"])
+```
+
+
+```{r}
+
+t.test(df_toPlot_melanoma$combine_scores[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Melanocytic/Transitory"] ~ df_toPlot_melanoma$Condition[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Melanocytic/Transitory"])
+t.test(df_toPlot_melanoma$combine_scores[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Neural crest-like"] ~ df_toPlot_melanoma$Condition[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Neural crest-like"])
+t.test(df_toPlot_melanoma$combine_scores[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Undifferentiated"] ~ df_toPlot_melanoma$Condition[df_toPlot_melanoma$scClassify_tumour_prediction2 %in% "Undifferentiated"])
+```
+
+
+
+
+```{r}
+ggplot(df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction2 %in% c("unassigned", "intermediate"), ], 
+       aes(x = scClassify_tumour_prediction2, 
+           y = combine_scores, fill = Condition)) +
+  geom_boxplot() +
+  scale_fill_tableau() +
+  xlab("") +
+  ylab("score") +
+  labs(color = "")
+ggsave(file.path(figures_dir, "boxplot_combine_nazarian_pratillas_scores.pdf"), width = 6, height = 5)
+df_source <- df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction2 %in% c("unassigned", "intermediate"), ]
+write.csv(df_source,
+          file.path(sourcedata_dir, "boxplot_combine_nazarian_pratillas_scores.csv"))
+```
+
+```{r}
+aggregate(df_source$combine_scores, list(df_source$Condition, df_source$scClassify_tumour_prediction2), median)
+```
+
+
+
+```{r}
+df_toPlot_melanoma$celltype_patient <- paste(df_toPlot_melanoma$scClassify_tumour_prediction, df_toPlot_melanoma$Sample, sep = "|")
+
+ggplot(df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate") & df_toPlot_melanoma$celltype_patient %in% names(which(table(df_toPlot_melanoma$celltype_patient) >= 50)), ], 
+       aes(x = scClassify_tumour_prediction, 
+           y = combine_scores, fill = Condition)) +
+  geom_boxplot() +
+  scale_fill_tableau() +
+  facet_wrap(~Patient, ncol = 5, nrow = 2)
+```
+
+
+
+
+```{r}
+
+ggplot(df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate") & df_toPlot_melanoma$celltype_patient2 %in% names(which(table(df_toPlot_melanoma$celltype_patient2) >= 50)), ], 
+       aes(x = scClassify_tumour_prediction2, 
+           y = combine_scores, fill = Condition)) +
+  geom_boxplot() +
+  scale_fill_tableau() +
+  facet_wrap(Sample.type~Patient_publish, ncol = 5, nrow = 2) +
+  xlab("") +
+  ylab("scores") +
+  theme(aspect.ratio = 1, axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave(file.path(figures_dir, "boxplot_combine_nazarian_pratillas_scores_per_patient.pdf"), width = 15, height = 6)
+
+```
+
+
+```{r}
+keep_idx <- !df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate") & df_toPlot_melanoma$celltype_patient2 %in% names(which(table(df_toPlot_melanoma$celltype_patient2) >= 50))
+agg_combine <- aggregate(combine_scores[keep_idx],
+                         list(df_toPlot_melanoma[keep_idx, ]$scClassify_tumour_prediction2,
+                              df_toPlot_melanoma[keep_idx, ]$Sample), 
+                         mean)
+colnames(agg_combine) <- c("celltype", "sample", "nazarian_scores")
+agg_combine$condition <- ifelse(grepl("DMSO", agg_combine$sample), "DMSO", "DT")
+agg_combine$patient <- gsub("_DMSO|_DT", "", agg_combine$sample)
+agg_combine <- dcast(agg_combine, celltype + patient~condition, value.var = "nazarian_scores")
+agg_combine$diff <- agg_combine$DMSO - agg_combine$DT
+print("Difference compare across cell type")
+
+lm_res <- lmerTest::lmer(diff~celltype + (1 | patient), data = agg_combine)
+summary(lm_res)
+```
+
+
+```{r}
+
+agg_combine_quantile20 <- aggregate(combine_scores[keep_idx],
+                                    list(df_toPlot_melanoma[keep_idx, ]$scClassify_tumour_prediction2,
+                                         df_toPlot_melanoma[keep_idx, ]$Sample), 
+                                    quantile, 0.15)
+colnames(agg_combine_quantile20) <- c("celltype", "sample", "combine_scores")
+agg_combine_quantile20$condition <- ifelse(grepl("DMSO", agg_combine_quantile20$sample), "DMSO", "DT")
+agg_combine_quantile20$patient <- gsub("_DMSO|_DT", "", agg_combine_quantile20$sample)
+agg_combine_quantile20 <- dcast(agg_combine_quantile20, celltype + patient~condition, value.var = "combine_scores")
+
+agg_combine_quantile20$celltype_patient <- paste(agg_combine_quantile20$celltype, agg_combine_quantile20$patient, sep = "|")
+df_toPlot_melanoma$responder <- NA
+
+for (i in 1:nrow(agg_combine_quantile20)) {
+  print(i)
+  idx <- df_toPlot_melanoma$celltype_patient2 == paste(agg_combine_quantile20$celltype_patient[i], "DT", sep = "_") & df_toPlot_melanoma$combine_scores > agg_combine_quantile20[1, "DMSO"]
+  print(sum(idx))
+  df_toPlot_melanoma$responder[idx] <- "nonresponder"
+}
+
+
+
+agg_combine_quantile10 <- aggregate(combine_scores[keep_idx],
+                                    list(df_toPlot_melanoma[keep_idx, ]$scClassify_tumour_prediction2,
+                                         df_toPlot_melanoma[keep_idx, ]$Sample), 
+                                    quantile, 0.05)
+colnames(agg_combine_quantile10) <- c("celltype", "sample", "combine_scores")
+agg_combine_quantile10$condition <- ifelse(grepl("DMSO", agg_combine_quantile10$sample), "DMSO", "DT")
+agg_combine_quantile10$patient <- gsub("_DMSO|_DT", "", agg_combine_quantile10$sample)
+agg_combine_quantile10 <- dcast(agg_combine_quantile10, celltype + patient~condition, value.var = "combine_scores")
+
+agg_combine_quantile10$celltype_patient <- paste(agg_combine_quantile10$celltype, agg_combine_quantile10$patient, sep = "|")
+
+for (i in 1:nrow(agg_combine_quantile10)) {
+  print(i)
+  idx <- df_toPlot_melanoma$celltype_patient2 == paste(agg_combine_quantile10$celltype_patient[i], "DT", sep = "_") & df_toPlot_melanoma$combine_scores < agg_combine_quantile10[1, "DT"]
+  print(sum(idx))
+  df_toPlot_melanoma$responder[idx] <- "responder"
+}
+table(df_toPlot_melanoma$responder, df_toPlot_melanoma$scClassify_tumour_prediction2)
+df_toPlot_melanoma$responder[is.na(df_toPlot_melanoma$responder)] <- "others"
+```
+
+```{r}
+ggplot(df_toPlot_melanoma[df_toPlot_melanoma$Condition == "DT" &
+                            !df_toPlot_melanoma$scClassify_tumour_prediction2 %in% c("unassigned", "intermediate"), ], 
+       aes(x = Patient_publish, fill = responder)) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_fill_manual(values = c("#E15759","grey", "#76B7B2")) +
+  facet_wrap(scClassify_tumour_prediction2~Sample.type, scale = "free", ncol = 2) +
+  theme(aspect.ratio = 0.4) +
+  xlab("") +
+  ylab("Proportion")
+ggsave(file.path(figures_dir, "barplot_resonder_proportion_per_patient.pdf"), width = 8, height = 6)
+df_subset <- df_toPlot_melanoma[df_toPlot_melanoma$Condition == "DT" &
+                                  !df_toPlot_melanoma$scClassify_tumour_prediction2 %in% c("unassigned", "intermediate"), ]
+tab <- table(df_subset$scClassify_tumour_prediction2,
+             df_subset$responder,
+             df_subset$Patient_publish)
+freq_celltype_prop <- lapply(1:dim(tab)[3], function(i) {
+  apply(tab[ , , i], 1, function(x) x/sum(x))
+})
+names(freq_celltype_prop) <- dimnames(tab)[[3]]
+df_freq_celltype_prop <- melt(freq_celltype_prop)
+df_count <- melt(tab)
+colnames(df_freq_celltype_prop) <- c("responder", "cellstate", "freq", "patient")
+colnames(df_count) <- c("cellstate", "responder", "patient", "counts")
+df_count <- merge(df_freq_celltype_prop, df_count)
+write.csv(df_count, file.path(sourcedata_dir, "resonder_proportion_per_patient.csv"))
+```
+
+
+
+## edgeR
+
+```{r}
+sce <- sce_melanoma
+sce$sample_id <- factor(paste(sce_melanoma$Sample, df_toPlot_melanoma$responder, sep = "_"))
+sce$cluster_id <- factor(df_toPlot_melanoma$scClassify_tumour_prediction2)
+sce$group_id <- df_toPlot_melanoma$responder
+metadata(sce)$experiment_info <- unique(colData(sce)[, c("sample_id", "group_id")])
+
+library(muscat)
+pb <- aggregateData(sce,
+                    assay = "counts", fun = "sum",
+                    by = c("cluster_id", "sample_id"))
+pb <- pb[, grep("DT_responder|DT_nonresponder", colnames(pb))]
+```
+
+
+
+```{r}
+
+edger_weights_res <- lapply(assayNames(pb)[c(2, 3, 5)], function(x) {
+  edgeR(assay(pb, x),
+        group_id = pb$group_id,
+        coldata = colData(pb),
+        covariate = c("Sample"),
+        #weights = sample_weights[x, colnames(pb)],
+        coef = 2)
+})
+names(edger_weights_res) <- assayNames(pb)[c(2, 3, 5)]
+unlist(lapply(edger_weights_res, function(x) sum(x$responder$FDR<0.05)))
+unlist(lapply(edger_weights_res, function(x) sum((x$responder$logFC) > 1)))
+unlist(lapply(edger_weights_res, function(x) sum((x$responder$logFC) < -2)))
+```
+
+
+
+
+```{r results = "hide", message=FALSE}
+hallmark_fgsea_list <- lapply(edger_weights_res, function(x) {
+  x <- x$responder
+  logfc <- x$logFC
+  names(logfc) <- rownames(x)
+  logfc <- na.omit(logfc)
+  hallmark_fgsea <- runFGSEA(logfc, hallmarkList)
+  hallmark_fgsea <- data.frame(hallmark_fgsea)
+})
+hallmark_fgsea_list <- lapply(hallmark_fgsea_list, function(x) {
+  rownames(x) <- x[, 1]
+  x
+})
+```
+
+```{r}
+df_nes <- do.call(cbind, lapply(hallmark_fgsea_list, function(x) x[names(hallmarkList), "NES"]))
+rownames(df_nes) <- names(hallmarkList)
+colnames(df_nes) <- names(edger_weights_res)
+df_pval <- do.call(cbind, lapply(hallmark_fgsea_list, function(x) x[names(hallmarkList), "pval"]))
+rownames(df_pval) <- names(hallmarkList)
+colnames(df_pval) <- names(edger_weights_res)
+
+df_nes <- melt(df_nes)
+df_pval <- melt(df_pval)
+df_nes <- merge(df_nes, df_pval, by = c("Var1", "Var2"))
+
+colnames(df_nes) <- c("pathway", "celltype", "NES", "pval")
+df_nes_agg <- df_nes %>%
+  group_by(pathway) %>%
+  summarise(NES = mean(NES))
+keep_pathways <- c(as.character(df_nes_agg[which(df_nes_agg$NES >= sort(df_nes_agg$NES, decreasing = TRUE)[5]),]$pathway),
+                   as.character(df_nes_agg[which(df_nes_agg$NES <= sort(df_nes_agg$NES)[10]),]$pathway))
+keep_pathways <- unique(keep_pathways)
+saveRDS(keep_pathways, file = "results/selected_pathways_inhouse_figure4c.rds")
+library(scales)
+ggplot(df_nes, aes(x = celltype, 
+                   y = gsub("_", " ", gsub("HALLMARK_", "", pathway)), 
+                   color = NES, size = -log10(pval))) +
+  geom_point() +
+  scale_color_gradientn(colors = rdbu, limits = c(-2.9, 1.5), 
+                        values = rescale(c(-2.9, 0, 1.5))) +
+  labs(title = "") +
+  theme(aspect.ratio = 3.5, axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  xlab("") +
+  ylab("") 
+ggsave(file.path(figures_dir, "dotplot_edgeR_nazarian_combined_scores.pdf"), width = 6, height = 12)
+write.csv(df_nes,
+          file.path(sourcedata_dir, "dotplot_edgeR_nazarian_combined_scores.csv"))
+
+
+df_nes_subset <- df_nes[df_nes$pathway %in% keep_pathways, ]
+df_nes_subset$pathway <- factor(df_nes_subset$pathway, levels = as.character(df_nes_agg$pathway[order(df_nes_agg$NES)]))
+df_nes_subset$pathway <- droplevels(df_nes_subset$pathway)
+library(scales)
+ggplot(df_nes_subset, aes(x = celltype, 
+                          y = gsub("_", " ", gsub("HALLMARK_", "", pathway)), 
+                          color = NES, size = -log10(pval))) +
+  geom_point() +
+  scale_color_gradientn(colors = rdbu, limits = c(-2.9, 1.5), 
+                        values = rescale(c(-2.9, 0, 1.5))) +
+  labs(title = "") +
+  theme(aspect.ratio = 3.5, axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  xlab("") +
+  ylab("") 
+ggsave(file.path(figures_dir, "dotplot_edgeR_nazarian_combined_scores_selected.pdf"), width = 6, height = 6)
+write.csv(df_nes_subset,
+          file.path(sourcedata_dir, "dotplot_edgeR_nazarian_combined_scores_selected.csv"))
+```
+
+
+# Hallmark
+
+```{r}
+hallmark_scores <- lapply(hallmarkList, function(x) {
+  apply(logcounts(sce_melanoma)[intersect(x, rownames(sce_melanoma)), ], 2, mean_trim_low, trim = 0.1)
+})
+
+
+```
+
+
+```{r}
+df_melanoma_subset <- df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate"), ]
+df_melanoma_subset$HALLMARK_IL6_JAK_STAT3_SIGNALING <- hallmark_scores$HALLMARK_IL6_JAK_STAT3_SIGNALING[rownames(df_melanoma_subset)]
+g1 <- ggplot(df_melanoma_subset, 
+             aes(x = scClassify_tumour_prediction2, 
+                 y = HALLMARK_IL6_JAK_STAT3_SIGNALING, fill = responder)) +
+  geom_boxplot() +
+  xlab("") +
+  scale_fill_manual(values = c("#E15759","grey", "#76B7B2")) +
+  ylab("IL6 JAK STAT3 SIGNALING") +
+  theme(aspect.ratio = 1)
+
+
+df_melanoma_subset <- df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate"), ]
+df_melanoma_subset$HALLMARK_TNFA_SIGNALING_VIA_NFKB <- hallmark_scores$HALLMARK_TNFA_SIGNALING_VIA_NFKB[rownames(df_melanoma_subset)]
+g2 <- ggplot(df_melanoma_subset, 
+             aes(x = scClassify_tumour_prediction2, 
+                 y = HALLMARK_TNFA_SIGNALING_VIA_NFKB, fill = responder)) +
+  geom_boxplot() +
+  xlab("") +
+  scale_fill_manual(values = c("#E15759","grey", "#76B7B2")) +
+  ylab("TNFA SIGNALING VIA NFKB") +
+  theme(aspect.ratio = 1)
+
+ggarrange(g1, g2, ncol = 2, nrow = 1, align = "hv", common.legend = TRUE)
+
+ggsave(file.path(figures_dir, "boxplot_IL6_TNF_scores.pdf"), width = 10, height = 6)
+write.csv(df_melanoma_subset, file.path(sourcedata_dir, "boxplot_IL6_TNF_scores.csv"))
+
+```
+
+```{r}
+
+
+df_melanoma_subset <- df_toPlot_melanoma[!df_toPlot_melanoma$scClassify_tumour_prediction %in% c("unassigned", "intermediate"), ]
+g <- lapply(names(hallmark_scores), function(i) {
+  
+  df_melanoma_subset[, i] <- hallmark_scores[[i]][rownames(df_melanoma_subset)]
+  ggplot(df_melanoma_subset, 
+         aes_string(x = "scClassify_tumour_prediction2", 
+                    y = i, fill = "responder")) +
+    geom_boxplot() +
+    xlab("") +
+    scale_fill_manual(values = c("#E15759","grey", "#76B7B2")) +
+    ylab(i) +
+    theme(aspect.ratio = 1)
+  
+})
+
+ggarrange(plotlist = g, ncol = 9, nrow = 6, align = "hv", common.legend = TRUE)
+ggsave(file.path(figures_dir, "boxplot_all_hallmark_scores.pdf"), width = 50, height = 30, limitsize = FALSE)
+df_melanoma_subset <- cbind(df_melanoma_subset, do.call(cbind, hallmark_scores)[rownames(df_melanoma_subset), ])
+write.csv(df_melanoma_subset, file.path(sourcedata_dir, "boxplot_all_hallmark_scores.csv"))
+
+```
+
+
